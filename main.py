@@ -1,22 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Simple Audio Editor — Multi-Track + Meters (v4)
-
-Fixes / additions vs v3:
-- Dragging a clip vertically now MOVES it between tracks in the data model
-  (removes from old track list, adds to the new one).
-- Playhead always advances while playing.
-- Resizable window (handles VIDEORESIZE).
-- Small UX polish: grid snap toggle, better status text, safer calculations.
-
-Dependencies:
-    pip install pygame numpy
-    # optional (MP3/FLAC loading and pitch-preserving stretch):
-    pip install librosa soundfile
-"""
-
 import os
 import sys
 import wave
