@@ -1,15 +1,34 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Simple Audio Editor — Multi-Track + Meters (v4)
+
+Fixes / additions vs v3:
+- Dragging a clip vertically now MOVES it between tracks in the data model
+  (removes from old track list, adds to the new one).
+- Playhead always advances while playing.
+- Resizable window (handles VIDEORESIZE).
+- Small UX polish: grid snap toggle, better status text, safer calculations.
+
+Dependencies:
+    pip install pygame numpy
+    # optional (MP3/FLAC loading and pitch-preserving stretch):
+    pip install librosa soundfile
+"""
+
 import os
 import sys
 import wave
-import sqlite3
 import warnings
 import subprocess
-from datetime import datetime
+from math import log10
+from typing import List, Tuple, Optional
 
 import numpy as np
 import pygame
 
-# ===== Optional libs (no DawDreamer) =====
+# -------- Optional loader / stretch (no DawDreamer) --------
 try:
     import librosa
     import soundfile as sf  # noqa: F401
@@ -18,11 +37,10 @@ except Exception:
     LIBROSA_AVAILABLE = False
 
 SR = 44100
-
 warnings.filterwarnings("ignore", message=r".*__audioread_load.*", category=FutureWarning)
 warnings.filterwarnings("ignore", message=r"PySoundFile failed.*")
 
-# ===== macOS-safe file dialogs =====
+# -------- macOS-safe dialogs (avoid Tk/SDL clash) --------
 TK_AVAILABLE = False
 if sys.platform != "darwin":
     try:
@@ -31,6 +49,7 @@ if sys.platform != "darwin":
         TK_AVAILABLE = True
     except Exception:
         TK_AVAILABLE = False
+
 
 def choose_open_file(title="Open", pattern="public.audio"):
     if sys.platform == "darwin":
@@ -44,14 +63,16 @@ def choose_open_file(title="Open", pattern="public.audio"):
     if TK_AVAILABLE:
         try:
             root = tk.Tk(); root.withdraw(); root.update()
-            fp = filedialog.askopenfilename(title=title,
-                                            filetypes=[("Audio", "*.wav *.mp3 *.flac *.aiff *.aif *.ogg"),
-                                                       ("All files", "*.*")])
+            fp = filedialog.askopenfilename(
+                title=title,
+                filetypes=[("Audio", "*.wav *.mp3 *.flac *.aiff *.aif *.ogg"), ("All files", "*.*")]
+            )
             root.destroy()
             return fp if fp else None
         except Exception:
             return None
     return None
+
 
 def choose_save_file(title="Save As", default_name="mix.wav"):
     if sys.platform == "darwin":
@@ -67,16 +88,19 @@ def choose_save_file(title="Save As", default_name="mix.wav"):
     if TK_AVAILABLE:
         try:
             root = tk.Tk(); root.withdraw(); root.update()
-            fp = filedialog.asksaveasfilename(title=title, defaultextension=".wav",
-                                              filetypes=[("WAV", "*.wav")], initialfile=default_name)
+            fp = filedialog.asksaveasfilename(
+                title=title, defaultextension=".wav", filetypes=[("WAV", "*.wav")], initialfile=default_name
+            )
             root.destroy()
             return fp if fp else None
         except Exception:
             return None
     return None
 
-# ===== Audio helpers =====
-def load_audio(path, target_sr=SR):
+
+# -------- Audio helpers --------
+def load_audio(path: str, target_sr: int = SR) -> Tuple[np.ndarray, int]:
+    """Return mono float32 [-1,1], sr."""
     if LIBROSA_AVAILABLE:
         y, _ = librosa.load(path, sr=target_sr, mono=True)
         y = y.astype(np.float32)
@@ -99,256 +123,293 @@ def load_audio(path, target_sr=SR):
             sr = target_sr
         return arr, sr
 
-def time_stretch(y, speed):
+
+def time_stretch(y: np.ndarray, speed: float) -> np.ndarray:
+    """speed>1 → faster (shorter). If no librosa, naive resample (pitch changes)."""
     speed = max(0.25, min(2.0, float(speed)))
     if not y.size:
         return y.astype(np.float32)
     if LIBROSA_AVAILABLE:
         return librosa.effects.time_stretch(y, rate=speed).astype(np.float32)
-    # naive resample (changes pitch)
-    n_new = int(len(y) / speed)
-    if n_new <= 0:
-        n_new = 1
+    n_new = max(1, int(len(y) / speed))
     t_old = np.linspace(0, 1, len(y), endpoint=False)
     t_new = np.linspace(0, 1, n_new, endpoint=False)
     return np.interp(t_new, t_old, y).astype(np.float32)
 
-def to_stereo(mono):
+
+def to_stereo(mono: np.ndarray) -> np.ndarray:
     return np.vstack([mono, mono])
 
-def to_int16_stereo(st):
+
+def to_int16_stereo(st: np.ndarray) -> np.ndarray:
     st = np.clip(st, -1.0, 1.0)
     return (st * 32767).astype(np.int16)
 
-# ===== Data models =====
+
+# -------- Data models --------
 class Clip:
-    def __init__(self, audio, name, start=0.0, speed=1.0, gain=1.0, in_pos=0.0, out_pos=None):
-        self.audio = audio.astype(np.float32)  # mono
+    def __init__(self, audio: np.ndarray, name: str, start=0.0, speed=1.0, gain=1.0, in_pos=0.0, out_pos=None):
+        self.audio = audio.astype(np.float32)
         self.name = name
-        self.start = float(start)  # timeline start (sec)
-        self.speed = float(speed)  # 1.0 normal; 0.5 slower; 2.0 faster
+        self.start = float(start)    # timeline start (sec)
+        self.speed = float(speed)    # 1.0 normal; 0.5 slower; 1.5 faster
         self.gain = float(gain)
-        self.in_pos = float(in_pos)  # seconds into original audio
+        self.in_pos = float(in_pos)  # seconds into source
         self.out_pos = float(out_pos) if out_pos is not None else (len(audio)/SR)
         self.track_index = 0
         self.selected = False
-        # layout cache
-        self.rect = None
+        self.rect: Optional[pygame.Rect] = None  # UI cache
 
     @property
-    def src_len_sec(self):
-        return len(self.audio) / SR
-
-    @property
-    def eff_len_sec(self):
+    def eff_len_sec(self) -> float:
         return max(0.0, (self.out_pos - self.in_pos) / max(self.speed, 1e-6))
 
-    def bounds(self):
+    def bounds(self) -> Tuple[float, float]:
         return self.start, self.start + self.eff_len_sec
 
-    def cut_at(self, t_sec):
-        """Split clip at absolute timeline time t_sec; returns right part or None."""
+    def cut_at(self, t_sec: float) -> Optional["Clip"]:
+        """Split at timeline time t_sec; return right piece or None if outside."""
         left, right = self.bounds()
         if t_sec <= left + 1e-6 or t_sec >= right - 1e-6:
             return None
-        # timeline delta to split
         dt = t_sec - self.start
-        # Source seconds consumed = dt * speed
         consumed = dt * self.speed
         split_src = self.in_pos + consumed
-        # left remains [in_pos, split_src], right becomes [split_src, out_pos] starting at t_sec
-        right_clip = Clip(
-            audio=self.audio,
-            name=self.name + " (split)",
-            start=t_sec,
-            speed=self.speed,
-            gain=self.gain,
-            in_pos=split_src,
-            out_pos=self.out_pos,
-        )
-        # shorten left
+        right_clip = Clip(self.audio, name=self.name + " (split)", start=t_sec,
+                          speed=self.speed, gain=self.gain, in_pos=split_src, out_pos=self.out_pos)
         self.out_pos = split_src
         return right_clip
 
-class Track:
-    def __init__(self, name, volume=1.0, mute=False, solo=False):
-        self.name = name
-        self.volume = float(volume)
-        self.mute = mute
-        self.solo = solo
-        self.clips = []
 
-# ===== UI =====
+class Track:
+    def __init__(self, name: str):
+        self.name = name
+        self.volume = 1.0
+        self.mute = False
+        self.solo = False
+        self.clips: List[Clip] = []
+        # runtime
+        self.meter_level = 0.0       # 0..1 (post-fader)
+        self._fader_rect: Optional[pygame.Rect] = None
+        self._mute_rect: Optional[pygame.Rect] = None
+        self._solo_rect: Optional[pygame.Rect] = None
+
+
+# -------- UI setup --------
 pygame.init()
 pygame.mixer.init(frequency=SR, size=-16, channels=2, buffer=1024)
 
-WIDTH, HEIGHT = 1200, 820
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Simple Audio Editor (No DawDreamer)")
+WIDTH, HEIGHT = 1220, 860
+screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
+pygame.display.set_caption("Simple Audio Editor — Multi-Track + Meters (v4)")
 
-COL_BG = (20,20,26)
-COL_PANEL = (36,36,48)
-COL_ACC = (95,175,255)
-COL_ACC2 = (120,220,160)
-COL_TXT = (235,235,235)
-COL_MUTED = (150,150,160)
-COL_ERR = (240,80,80)
-COL_OK = (120,220,120)
-COL_GRID = (70,70,85)
-COL_CLIP = (85,120,200)
-COL_CLIP_SEL = (180,140,80)
+COL_BG = (20, 20, 26)
+COL_PANEL = (36, 36, 48)
+COL_ACC = (95, 175, 255)
+COL_ACC2 = (120, 220, 160)
+COL_TXT = (235, 235, 235)
+COL_MUTED = (150, 150, 160)
+COL_ERR = (240, 80, 80)
+COL_OK = (120, 220, 120)
+COL_GRID = (70, 70, 85)
+COL_CLIP = (85, 120, 200)
+COL_CLIP_SEL = (180, 140, 80)
+COL_METER_BG = (40, 40, 55)
+COL_METER = (90, 220, 120)
+COL_MUTE = (210, 80, 80)
+COL_SOLO = (240, 200, 90)
 
 pygame.font.init()
-FONT_LG = pygame.font.SysFont("Arial", 24, bold=True)
 FONT_MD = pygame.font.SysFont("Arial", 16, bold=True)
 FONT_SM = pygame.font.SysFont("Arial", 12)
 
+
 class Button:
-    def __init__(self, x,y,w,h,label,fn, toggle=False, state=False):
-        self.rect = pygame.Rect(x,y,w,h)
+    def __init__(self, x, y, w, h, label, fn, toggle=False, state=False):
+        self.rect = pygame.Rect(x, y, w, h)
         self.label = label
         self.fn = fn
         self.toggle = toggle
         self.state = state
         self.hover = False
+
     def draw(self, surf):
         base = COL_ACC2 if (self.toggle and self.state) else COL_ACC
-        col = base if not self.hover else (min(base[0]+40,255),min(base[1]+40,255),min(base[2]+40,255))
+        col = base if not self.hover else (min(base[0]+40, 255), min(base[1]+40, 255), min(base[2]+40, 255))
         pygame.draw.rect(surf, col, self.rect, border_radius=6)
-        pygame.draw.rect(surf, (col[0]//2,col[1]//2,col[2]//2), self.rect, 2, border_radius=6)
+        pygame.draw.rect(surf, (col[0]//2, col[1]//2, col[2]//2), self.rect, 2, border_radius=6)
         t = FONT_SM.render(self.label, True, COL_TXT)
         surf.blit(t, t.get_rect(center=self.rect.center))
+
     def update(self, mouse):
         self.hover = self.rect.collidepoint(mouse)
+
     def handle(self, e):
-        if e.type==pygame.MOUSEBUTTONDOWN and e.button==1 and self.hover:
+        if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1 and self.hover:
             if self.toggle:
                 self.state = not self.state
-            if self.fn: self.fn()
+            if self.fn:
+                self.fn()
+
 
 class Slider:
-    def __init__(self,x,y,w,label,minv,maxv,val):
-        self.rect = pygame.Rect(x,y,w,20)
+    def __init__(self, x, y, w, label, minv, maxv, val):
+        self.rect = pygame.Rect(x, y, w, 20)
         self.label = label
-        self.min=minv; self.max=maxv; self.val=val
-        self.drag=False
+        self.min = minv
+        self.max = maxv
+        self.val = val
+        self.drag = False
+
     def draw(self, surf):
-        surf.blit(FONT_SM.render(f"{self.label}: {self.val:.2f}", True, COL_TXT),(self.rect.x, self.rect.y-16))
-        track = pygame.Rect(self.rect.x, self.rect.y+9, self.rect.w, 3)
-        pygame.draw.rect(surf, (70,70,90), track)
-        rel = (self.val-self.min)/(self.max-self.min)
-        x = self.rect.x + int(rel*self.rect.w)
-        pygame.draw.circle(surf, COL_ACC, (x, self.rect.y+10), 8)
+        surf.blit(FONT_SM.render(f"{self.label}: {self.val:.2f}", True, COL_TXT), (self.rect.x, self.rect.y - 16))
+        track = pygame.Rect(self.rect.x, self.rect.y + 9, self.rect.w, 3)
+        pygame.draw.rect(surf, (70, 70, 90), track)
+        rel = (self.val - self.min) / (self.max - self.min)
+        x = self.rect.x + int(rel * self.rect.w)
+        pygame.draw.circle(surf, COL_ACC, (x, self.rect.y + 10), 8)
+
     def update(self, mouse, pressed):
         if pressed[0]:
             if self.drag or self.rect.collidepoint(mouse):
-                self.drag=True
-                rel = (mouse[0]-self.rect.x)/self.rect.w
-                rel = max(0,min(1,rel))
-                self.val = self.min + rel*(self.max-self.min)
+                self.drag = True
+                rel = (mouse[0] - self.rect.x) / self.rect.w
+                rel = max(0, min(1, rel))
+                self.val = self.min + rel * (self.max - self.min)
         else:
-            self.drag=False
+            self.drag = False
 
-class TextInput:
-    def __init__(self,x,y,w,label):
-        self.rect=pygame.Rect(x,y,w,26); self.label=label; self.text=""; self.active=False
-    def draw(self,surf):
-        surf.blit(FONT_SM.render(self.label, True, COL_TXT),(self.rect.x, self.rect.y-16))
-        pygame.draw.rect(surf, (100,140,200) if self.active else COL_ACC, self.rect, border_radius=6)
-        pygame.draw.rect(surf, (60,90,140), self.rect, 2, border_radius=6)
-        t=FONT_SM.render(self.text, True, COL_TXT); surf.blit(t,(self.rect.x+6,self.rect.y+5))
-    def handle(self,e):
-        if e.type==pygame.MOUSEBUTTONDOWN and e.button==1:
-            self.active = self.rect.collidepoint(e.pos)
-        if self.active and e.type==pygame.KEYDOWN:
-            if e.key==pygame.K_BACKSPACE: self.text=self.text[:-1]
-            elif e.key==pygame.K_RETURN: self.active=False
-            elif e.unicode and e.key!=pygame.K_TAB: self.text+=e.unicode
 
+# -------- Editor --------
 class SimpleEditor:
     def __init__(self):
-        self.tracks = [Track("Track 1")]
-        self.selected_track = 0
-        self.selected_clip = None
-        self.px_per_sec = 80.0  # zoom
-        self.timeline_origin_x = 180
-        self.track_h = 80
-        self.ruler_h = 32
+        # layout
+        self.timeline_origin_x = 210
+        self.track_h = 92
+        self.ruler_h = 34
         self.top_bar_h = 60
+        self.px_per_sec = 90.0
+        self.snap = True         # snap to 0.1 s grid when dragging horizontally
+        self.snap_sec = 0.1
 
+        # model
+        self.tracks: List[Track] = []
+        self._create_track()                  # Track 1
+        self.selected_track = 0
+        self.selected_clip: Optional[Clip] = None
+
+        # playback
         self.playhead = 0.0
         self.playing = False
-        self.play_started_ms = None
-        self.play_end_sec = None
+        self.play_started_ms: Optional[int] = None
+        self.render_start_sec = 0.0
+        self.play_end_sec: Optional[float] = None
+        self._stems: Optional[List[np.ndarray]] = None
+        self.mix_sound: Optional[pygame.mixer.Sound] = None
 
-        # Drag state
-        self.drag_mode = None  # 'move', 'trim_l', 'trim_r', 'scrub'
+        # drag state
+        self.drag_mode: Optional[str] = None  # 'move','trim_l','trim_r','scrub','fader'
         self.drag_offset_time = 0.0
-        self.drag_clip_ref = None
+        self.drag_clip_ref: Optional[Clip] = None
+        self.drag_fader_track: Optional[int] = None
+        self.drag_from_track: Optional[int] = None
 
-        # UI controls
-        self.btn_play = Button(10,10,60,30,"Play", self.play)
-        self.btn_stop = Button(80,10,60,30,"Stop", self.stop)
-        self.btn_save = Button(150,10,100,30,"Save WAV…", self.saveas)
-        self.btn_add_track = Button(260,10,90,30,"+ Track", self.add_track)
-        self.btn_import = Button(355,10,120,30,"Import Clip", self.import_clip)
-        self.btn_delete = Button(480,10,90,30,"Delete", self.delete_selected)
-        self.btn_split = Button(575,10,110,30,"Split @ Play", self.split_at_playhead)
-        self.btn_zoom_in = Button(690,10,60,30,"+",
-                                  lambda: self.set_zoom(self.px_per_sec*1.25))
-        self.btn_zoom_out= Button(755,10,60,30,"-",
-                                  lambda: self.set_zoom(self.px_per_sec/1.25))
+        # UI
+        self.btn_play = Button(10, 10, 60, 30, "Play", self.play)
+        self.btn_stop = Button(80, 10, 60, 30, "Stop", self.stop)
+        self.btn_save = Button(150, 10, 110, 30, "Save WAV…", self.saveas)
+        self.btn_add_track = Button(270, 10, 90, 30, "+ Track", self.add_track)
+        self.btn_import = Button(365, 10, 120, 30, "Import Clip", self.import_clip)
+        self.btn_delete = Button(490, 10, 90, 30, "Delete", self.delete_selected)
+        self.btn_split = Button(585, 10, 120, 30, "Split @ Play", self.split_at_playhead)
+        self.btn_zoom_in = Button(710, 10, 60, 30, "+", lambda: self.set_zoom(self.px_per_sec * 1.25))
+        self.btn_zoom_out = Button(775, 10, 60, 30, "-", lambda: self.set_zoom(self.px_per_sec / 1.25))
+        self.btn_snap = Button(840, 10, 80, 30, "Snap", self.toggle_snap, toggle=True, state=self.snap)
 
-        self.sld_gain = Slider(10, self.top_bar_h+5, 150, "Clip Gain", 0.0, 2.0, 1.0)
-        self.sld_speed= Slider(10, self.top_bar_h+35, 150, "Clip Speed", 0.5, 1.5, 1.0)
+        self.sld_gain = Slider(10, self.top_bar_h + 6, 170, "Clip Gain", 0.0, 2.0, 1.0)
+        self.sld_speed = Slider(10, self.top_bar_h + 36, 170, "Clip Speed", 0.5, 1.5, 1.0)
 
-        self.status = "Ready." ; self.status_col = COL_TXT
-        self.mix_sound = None
-        self.last_render = None  # (audio mono, start_sec)
+        self.status = "Ready."
+        self.status_col = COL_TXT
 
-    def set_status(self,msg,ok=True):
-        self.status = msg; self.status_col = COL_OK if ok else COL_ERR
-
-    def time_to_x(self, t_sec):
-        return int(self.timeline_origin_x + t_sec * self.px_per_sec)
-
-    def x_to_time(self, x):
-        return max(0.0, (x - self.timeline_origin_x) / self.px_per_sec)
-
-    def track_y(self, idx):
-        return self.top_bar_h + self.ruler_h + idx*self.track_h
+    # ----- track creation / naming -----
+    def _create_track(self):
+        idx = len(self.tracks) + 1             # 1-based numbering
+        self.tracks.append(Track(f"Track {idx}"))
 
     def add_track(self):
-        self.tracks.append(Track(f"Track {len(self.tracks)+0}"))
-        self.set_status("Track added.")
+        self._create_track()
+        self.selected_track = len(self.tracks) - 1
+        self.set_status(f"Added Track {self.selected_track + 1}")
 
-    def import_clip(self):
-        path = choose_open_file("Choose audio")
-        if not path: self.set_status("Import cancelled.", ok=True); return
-        try:
-            y,_ = load_audio(path)
-            name = os.path.basename(path)
-            c = Clip(y, name=name, start=self.playhead, speed=1.0, gain=1.0)
-            c.track_index = self.selected_track
-            self.tracks[self.selected_track].clips.append(c)
-            self.select_clip(c)
-            self.set_status(f"Imported {name}")
-        except Exception as e:
-            self.set_status(f"Import failed: {e}", ok=False)
+    # ----- helpers -----
+    def set_status(self, msg, ok=True):
+        self.status = msg
+        self.status_col = COL_OK if ok else COL_ERR
 
-    def select_clip(self, clip):
+    def set_zoom(self, new_pps: float):
+        self.px_per_sec = max(30.0, min(480.0, float(new_pps)))
+
+    def maybe_snap(self, t: float) -> float:
+        if not self.snap:
+            return max(0.0, t)
+        grid = self.snap_sec
+        return max(0.0, round(t / grid) * grid)
+
+    def time_to_x(self, t_sec: float) -> int:
+        return int(self.timeline_origin_x + t_sec * self.px_per_sec)
+
+    def x_to_time(self, x: int) -> float:
+        return max(0.0, (x - self.timeline_origin_x) / self.px_per_sec)
+
+    def track_y(self, idx: int) -> int:
+        return self.top_bar_h + self.ruler_h + idx * self.track_h
+
+    def project_length(self) -> float:
+        end = 0.0
+        for tr in self.tracks:
+            for c in tr.clips:
+                _, right = c.bounds()
+                end = max(end, right)
+        return end
+
+    def toggle_snap(self):
+        self.snap = not self.snap
+        self.btn_snap.state = self.snap
+        self.set_status(f"Snap {'ON' if self.snap else 'OFF'}")
+
+    # ----- selection -----
+    def select_clip(self, clip: Optional[Clip]):
         if self.selected_clip is not None:
             self.selected_clip.selected = False
         self.selected_clip = clip
         if clip is not None:
             clip.selected = True
-            # sync sliders
-            self.sld_gain.val = clip.gain
-            self.sld_speed.val = clip.speed
+            if self.drag_mode is None:
+                self.sld_gain.val = clip.gain
+                self.sld_speed.val = clip.speed
+
+    # ----- clip ops -----
+    def import_clip(self):
+        path = choose_open_file("Choose audio")
+        if not path:
+            self.set_status("Import cancelled.", ok=True)
+            return
+        try:
+            y, _ = load_audio(path)
+            name = os.path.basename(path)
+            c = Clip(y, name=name, start=self.playhead, speed=1.0, gain=1.0)
+            c.track_index = self.selected_track
+            self.tracks[self.selected_track].clips.append(c)
+            self.select_clip(c)
+            self.set_status(f"Imported {name} → Track {self.selected_track+1}")
+        except Exception as e:
+            self.set_status(f"Import failed: {e}", ok=False)
 
     def delete_selected(self):
         c = self.selected_clip
-        if not c: return
+        if not c:
+            return
         tr = self.tracks[c.track_index]
         if c in tr.clips:
             tr.clips.remove(c)
@@ -357,7 +418,8 @@ class SimpleEditor:
 
     def split_at_playhead(self):
         c = self.selected_clip
-        if not c: return
+        if not c:
+            return
         rc = c.cut_at(self.playhead)
         if rc is not None:
             rc.track_index = c.track_index
@@ -366,140 +428,134 @@ class SimpleEditor:
         else:
             self.set_status("Playhead not inside clip.", ok=False)
 
-    # ===== Rendering / playback =====
-    def project_length(self):
-        end = 0.0
-        for ti, tr in enumerate(self.tracks):
-            for c in tr.clips:
-                l,r = c.bounds()
-                end = max(end, r)
-        return end
-
-    def render_mix(self, start_sec=0.0):
-        # Figure end time
+    # ----- rendering / stems -----
+    def render_mix_with_stems(self, start_sec: float = 0.0) -> Tuple[np.ndarray, float, List[np.ndarray]]:
         end_sec = self.project_length()
         if end_sec <= start_sec + 1e-6:
-            return np.zeros(1, dtype=np.float32), start_sec
-        n0 = int(start_sec * SR)
+            return np.zeros(1, dtype=np.float32), start_sec, [np.zeros(1, dtype=np.float32) for _ in self.tracks]
         n_total = int((end_sec - start_sec) * SR)
-        mix = np.zeros(n_total, dtype=np.float32)
+        stems = [np.zeros(n_total, dtype=np.float32) for _ in self.tracks]
 
-        # Solo/mute logic
         any_solo = any(tr.solo for tr in self.tracks)
 
-        for tr in self.tracks:
-            if any_solo and not tr.solo: 
+        for ti, tr in enumerate(self.tracks):
+            if any_solo and not tr.solo:
                 continue
-            if tr.mute: 
+            if tr.mute:
                 continue
-            t_gain = tr.volume
+            stem = stems[ti]
             for c in tr.clips:
-                # Compute overlap between clip and render window
                 left, right = c.bounds()
                 if right <= start_sec or left >= end_sec:
                     continue
-                # Source segment
-                seg_in = c.in_pos
-                seg_out = c.out_pos
-                seg = c.audio[int(seg_in*SR): int(seg_out*SR)]
-                if seg.size == 0: 
+                seg = c.audio[int(c.in_pos * SR): int(c.out_pos * SR)]
+                if seg.size == 0:
                     continue
-                # Stretch by speed
                 stretched = time_stretch(seg, c.speed)
-                # Determine where to place in mix
-                clip_len = len(stretched) / SR
                 clip_start = c.start
                 place_start = max(0.0, clip_start - start_sec)
                 i0 = int(place_start * SR)
-                # If clip truncated at left
                 if clip_start < start_sec:
                     cut = int((start_sec - clip_start) * SR)
-                    if cut < len(stretched):
-                        stretched = stretched[cut:]
-                    else:
-                        continue
-                # Truncate at project end
-                if i0 >= n_total:
+                    stretched = stretched[cut:] if cut < len(stretched) else np.zeros(0, dtype=np.float32)
+                if stretched.size == 0 or i0 >= n_total:
                     continue
-                max_take = n_total - i0
-                take = min(max_take, len(stretched))
+                take = min(n_total - i0, len(stretched))
                 if take > 0:
-                    mix[i0:i0+take] += stretched[:take] * (c.gain * t_gain)
-        # Hard clip
+                    stem[i0:i0+take] += stretched[:take] * c.gain
+            stems[ti] = stems[ti] * tr.volume
+
+        mix = np.sum(stems, axis=0)
         mix = np.clip(mix, -1.0, 1.0)
-        return mix, start_sec
+        return mix, start_sec, stems
 
     def play(self):
-        # Render from playhead to end
-        audio, start = self.render_mix(self.playhead)
+        audio, start, stems = self.render_mix_with_stems(self.playhead)
         if audio.size <= 1:
-            self.set_status("Nothing to play.", ok=False); return
+            self.set_status("Nothing to play.", ok=False)
+            return
         st = to_int16_stereo(to_stereo(audio))
         samples = np.transpose(st)
         self.mix_sound = pygame.sndarray.make_sound(samples.copy())
         self.mix_sound.play()
         self.playing = True
         self.play_started_ms = pygame.time.get_ticks()
+        self.render_start_sec = start
         self.play_end_sec = self.project_length()
+        self._stems = stems
         self.set_status("Playing…")
 
     def stop(self):
         pygame.mixer.stop()
         self.playing = False
         self.play_started_ms = None
+        self._stems = None
         self.set_status("Stopped.")
 
     def saveas(self):
-        # Render full
-        audio, _ = self.render_mix(0.0)
+        audio, _, _ = self.render_mix_with_stems(0.0)
         if audio.size <= 1:
-            self.set_status("Nothing to save.", ok=False); return
-        default = "mix.wav"
-        path = choose_save_file("Save Mix As", default_name=default)
-        if not path: self.set_status("Save cancelled.", ok=True); return
+            self.set_status("Nothing to save.", ok=False)
+            return
+        path = choose_save_file("Save Mix As", default_name="mix.wav")
+        if not path:
+            self.set_status("Save cancelled.", ok=True)
+            return
         try:
             st = to_int16_stereo(to_stereo(audio))
             with wave.open(path, 'wb') as wf:
-                wf.setnchannels(2); wf.setsampwidth(2); wf.setframerate(SR)
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(SR)
                 wf.writeframes(st.T.astype('<i2').tobytes())
             self.set_status(f"Saved: {path}")
         except Exception as e:
             self.set_status(f"Save failed: {e}", ok=False)
 
-    # ===== Mouse / keyboard =====
-    def pos_to_clip(self, x, y):
-        # Determine which track row
+    # ----- hit-testing -----
+    def pos_to_clip(self, x: int, y: int) -> Tuple[Optional[Clip], Optional[pygame.Rect]]:
         if y < self.top_bar_h + self.ruler_h:
             return None, None
-        rel_y = y - (self.top_bar_h + self.ruler_h)
-        row = int(rel_y // self.track_h)
+        row = int((y - (self.top_bar_h + self.ruler_h)) // self.track_h)
         if row < 0 or row >= len(self.tracks):
             return None, None
         t = self.tracks[row]
-        # Check clips
         for c in sorted(t.clips, key=lambda k: k.start, reverse=True):
-            # Build rect like draw would
             x1 = self.time_to_x(c.start)
             x2 = self.time_to_x(c.start + max(0.05, c.eff_len_sec))
-            r = pygame.Rect(x1, self.track_y(row)+6, x2-x1, self.track_h-12)
-            # fuzzy handles
-            if r.collidepoint(x,y):
+            r = pygame.Rect(x1, self.track_y(row) + 6, x2 - x1, self.track_h - 12)
+            if r.collidepoint(x, y):
                 return c, r
         return None, None
 
+    # ----- mouse -----
     def on_mousedown(self, pos, button):
-        x,y = pos
-        # Click ruler to set playhead or scrub
+        x, y = pos
+
+        # Track header (mute/solo/fader)
+        if y >= self.top_bar_h + self.ruler_h:
+            row = int((y - (self.top_bar_h + self.ruler_h)) // self.track_h)
+            if 0 <= row < len(self.tracks) and x < self.timeline_origin_x:
+                self.selected_track = row
+                tr = self.tracks[row]
+                if tr._mute_rect and tr._mute_rect.collidepoint(x, y):
+                    tr.mute = not tr.mute; self.set_status(f"{tr.name} mute = {tr.mute}"); return
+                if tr._solo_rect and tr._solo_rect.collidepoint(x, y):
+                    tr.solo = not tr.solo; self.set_status(f"{tr.name} solo = {tr.solo}"); return
+                if tr._fader_rect and tr._fader_rect.collidepoint(x, y):
+                    self.drag_mode = 'fader'; self.drag_fader_track = row; self._apply_fader_from_x(x); return
+
+        # Ruler scrubbing
         if self.top_bar_h <= y <= self.top_bar_h + self.ruler_h:
             self.playhead = self.x_to_time(x)
             self.drag_mode = 'scrub'
             return
+
         # Clips
-        c, rect = self.pos_to_clip(x,y)
+        c, rect = self.pos_to_clip(x, y)
         if c is not None:
             self.selected_track = c.track_index
             self.select_clip(c)
-            # edge handles
             handle = 8
             if abs(x - rect.left) <= handle:
                 self.drag_mode = 'trim_l'
@@ -509,45 +565,85 @@ class SimpleEditor:
                 self.drag_mode = 'move'
                 self.drag_offset_time = self.x_to_time(x) - c.start
             self.drag_clip_ref = c
+            self.drag_from_track = c.track_index
             return
-        # Empty area click selects track
+
+        # Empty track area selects track
         row = int((y - (self.top_bar_h + self.ruler_h)) // self.track_h)
         if 0 <= row < len(self.tracks):
             self.selected_track = row
             self.select_clip(None)
 
+    def _apply_fader_from_x(self, x: int):
+        ti = self.drag_fader_track
+        if ti is None:
+            return
+        tr = self.tracks[ti]
+        fr = tr._fader_rect
+        if not fr:
+            return
+        rel = (x - fr.x) / max(1, fr.w)
+        rel = max(0.0, min(1.0, rel))
+        tr.volume = 2.0 * rel  # 0..2x
+
     def on_mouseup(self, pos, button):
         self.drag_mode = None
         self.drag_clip_ref = None
+        self.drag_fader_track = None
+        self.drag_from_track = None
 
     def on_mousemove(self, pos, buttons):
-        x,y = pos
+        x, y = pos
         if self.drag_mode == 'scrub' and buttons[0]:
             self.playhead = self.x_to_time(x)
             return
-        c = self.drag_clip_ref
-        if c is None: 
+        if self.drag_mode == 'fader' and buttons[0]:
+            self._apply_fader_from_x(x)
             return
+        c = self.drag_clip_ref
+        if c is None:
+            return
+
+        # Determine target track under pointer
+        area_top = self.top_bar_h + self.ruler_h
+        row = int((y - area_top) // self.track_h)
+
         if self.drag_mode == 'move' and buttons[0]:
-            new_start = max(0.0, self.x_to_time(x) - self.drag_offset_time)
-            c.start = new_start
+            # Horizontal
+            new_start = self.maybe_snap(self.x_to_time(x) - self.drag_offset_time)
+            c.start = max(0.0, new_start)
+
+            # Vertical: move clip between track lists (FIX)
+            if 0 <= row < len(self.tracks) and row != c.track_index:
+                # remove from old track list
+                old_idx = c.track_index
+                if c in self.tracks[old_idx].clips:
+                    self.tracks[old_idx].clips.remove(c)
+                # add to new track
+                c.track_index = row
+                self.tracks[row].clips.append(c)
+                self.selected_track = row
+
         elif self.drag_mode == 'trim_l' and buttons[0]:
-            # compute new left time
             new_left_t = max(0.0, self.x_to_time(x))
+            if self.snap:
+                new_left_t = self.maybe_snap(new_left_t)
             dt = new_left_t - c.start
             if dt != 0.0:
-                # move start by dt, advance in_pos by dt*speed
                 src_advance = dt * c.speed
-                new_in = min(c.out_pos-0.01, max(0.0, c.in_pos + src_advance))
-                # compute actual advancement applied
+                new_in = min(c.out_pos - 0.01, max(0.0, c.in_pos + src_advance))
                 applied = new_in - c.in_pos
                 c.in_pos = new_in
-                c.start = c.start + (applied / max(c.speed,1e-6))
+                c.start = c.start + (applied / max(c.speed, 1e-6))
+
         elif self.drag_mode == 'trim_r' and buttons[0]:
             new_right_t = max(c.start + 0.01, self.x_to_time(x))
+            if self.snap:
+                new_right_t = max(c.start + 0.01, self.maybe_snap(new_right_t))
             eff_len = new_right_t - c.start
             c.out_pos = c.in_pos + eff_len * c.speed
 
+    # ----- keyboard -----
     def handle_keys(self, e):
         if e.type == pygame.KEYDOWN:
             if e.key == pygame.K_SPACE:
@@ -555,149 +651,206 @@ class SimpleEditor:
                 else: self.play()
             elif e.key == pygame.K_s and (e.mod & pygame.KMOD_META or e.mod & pygame.KMOD_CTRL):
                 self.saveas()
-            elif e.key == pygame.K_DELETE or e.key == pygame.K_BACKSPACE:
+            elif e.key in (pygame.K_DELETE, pygame.K_BACKSPACE):
                 self.delete_selected()
 
-    # ===== Draw =====
-    def draw_ruler(self, surf):
+    # ----- meters -----
+    def _db_to_level(self, db: float) -> float:
+        return max(0.0, min(1.0, (db + 60.0) / 60.0))  # map −60..0 dB → 0..1
+
+    def _update_track_meters(self, now_sec: float):
+        if not self.playing or self._stems is None:
+            for tr in self.tracks:
+                tr.meter_level *= 0.85
+            return
+        idx = int((now_sec - self.render_start_sec) * SR)
+        win = int(0.05 * SR)  # 50 ms window
+        for ti, tr in enumerate(self.tracks):
+            stem = self._stems[ti] if 0 <= ti < len(self._stems) else None
+            if stem is None or idx >= len(stem):
+                tr.meter_level *= 0.85
+                continue
+            i0 = max(0, idx - win)
+            i1 = min(len(stem), idx + win)
+            sl = stem[i0:i1]
+            if sl.size <= 4:
+                tr.meter_level *= 0.85
+                continue
+            rms = float(np.sqrt(np.mean(sl * sl)) + 1e-8)
+            db = 20.0 * log10(rms)
+            level = self._db_to_level(db)
+            tr.meter_level = max(level, tr.meter_level * 0.85)
+
+    # ----- drawing -----
+    def draw_ruler(self, surf, width):
         y0 = self.top_bar_h
-        pygame.draw.rect(surf, COL_PANEL, pygame.Rect(0,y0, WIDTH, self.ruler_h))
-        # seconds grid
-        max_sec = max(10, int((WIDTH - self.timeline_origin_x) / self.px_per_sec) + 5)
+        pygame.draw.rect(surf, COL_PANEL, pygame.Rect(0, y0, width, self.ruler_h))
+        max_sec = max(10, int((width - self.timeline_origin_x) / self.px_per_sec) + 5)
         for s in range(max_sec):
             x = self.time_to_x(s)
             pygame.draw.line(surf, COL_GRID, (x, y0), (x, y0 + self.ruler_h))
-            if s % 1 == 0:
-                t = FONT_SM.render(str(s), True, COL_MUTED)
-                surf.blit(t, (x+2, y0+8))
-        # playhead
+            t = FONT_SM.render(str(s), True, COL_MUTED)
+            surf.blit(t, (x + 2, y0 + 8))
         px = self.time_to_x(self.playhead)
         pygame.draw.line(surf, (250, 90, 90), (px, y0), (px, HEIGHT), 2)
 
-    def draw_tracks(self, surf):
-        # track headers
+    def draw_tracks(self, surf, width, height):
+        # headers + meters/faders
         for i, tr in enumerate(self.tracks):
             y = self.track_y(i)
-            pygame.draw.rect(surf, COL_PANEL, pygame.Rect(0,y, self.timeline_origin_x-2, self.track_h))
-            pygame.draw.rect(surf, (60,60,80), pygame.Rect(0,y, self.timeline_origin_x-2, self.track_h), 2)
-            name = f"{tr.name}  {'[M]' if tr.mute else ''}{'[S]' if tr.solo else ''}"
-            surf.blit(FONT_MD.render(name, True, COL_TXT),(10, y+10))
-        # clips
-        area = pygame.Rect(self.timeline_origin_x, self.top_bar_h + self.ruler_h, WIDTH - self.timeline_origin_x, HEIGHT)
-        pygame.draw.rect(surf, (28,28,38), area)
+            pygame.draw.rect(surf, COL_PANEL, pygame.Rect(0, y, self.timeline_origin_x - 2, self.track_h))
+            pygame.draw.rect(surf, (60, 60, 80), pygame.Rect(0, y, self.timeline_origin_x - 2, self.track_h), 2)
+            surf.blit(FONT_MD.render(tr.name, True, COL_TXT), (10, y + 6))
+
+            # mute / solo
+            tr._mute_rect = pygame.Rect(10, y + 30, 44, 22)
+            tr._solo_rect = pygame.Rect(60, y + 30, 44, 22)
+            pygame.draw.rect(surf, COL_MUTE if tr.mute else (90, 90, 90), tr._mute_rect, border_radius=5)
+            pygame.draw.rect(surf, (50, 50, 50), tr._mute_rect, 2, border_radius=5)
+            pygame.draw.rect(surf, COL_SOLO if tr.solo else (90, 90, 90), tr._solo_rect, border_radius=5)
+            pygame.draw.rect(surf, (50, 50, 50), tr._solo_rect, 2, border_radius=5)
+            surf.blit(FONT_SM.render("M", True, (15, 15, 18)), tr._mute_rect.move(15, 3))
+            surf.blit(FONT_SM.render("S", True, (15, 15, 18)), tr._solo_rect.move(15, 3))
+
+            # fader
+            f_x = 112
+            tr._fader_rect = pygame.Rect(f_x, y + 32, 80, 8)
+            pygame.draw.rect(surf, (70, 70, 90), tr._fader_rect, border_radius=4)
+            rel = tr.volume / 2.0
+            cx = int(tr._fader_rect.x + rel * tr._fader_rect.w)
+            pygame.draw.circle(surf, COL_ACC, (cx, tr._fader_rect.y + tr._fader_rect.h // 2), 7)
+            surf.blit(FONT_SM.render(f"{tr.volume:.2f}x", True, COL_MUTED), (f_x + 86, y + 23))
+
+            # meter
+            m_w = 10; m_h = self.track_h - 12
+            mx = self.timeline_origin_x - 16; my = y + 6
+            pygame.draw.rect(surf, COL_METER_BG, pygame.Rect(mx, my, m_w, m_h), border_radius=3)
+            lvl = int(m_h * max(0.0, min(1.0, tr.meter_level)))
+            if lvl > 0:
+                pygame.draw.rect(surf, COL_METER, pygame.Rect(mx, my + (m_h - lvl), m_w, lvl), border_radius=3)
+
+        # timeline rows + clips
+        area = pygame.Rect(self.timeline_origin_x, self.top_bar_h + self.ruler_h,
+                           width - self.timeline_origin_x, height - (self.top_bar_h + self.ruler_h))
+        pygame.draw.rect(surf, (28, 28, 38), area)
         for i, tr in enumerate(self.tracks):
             y = self.track_y(i)
-            # row line
-            pygame.draw.line(surf, (50,50,64), (self.timeline_origin_x, y), (WIDTH, y))
+            pygame.draw.line(surf, (50, 50, 64), (self.timeline_origin_x, y), (width, y))
             for c in tr.clips:
                 x1 = self.time_to_x(c.start)
                 w = max(10, int(max(0.02, c.eff_len_sec) * self.px_per_sec))
-                rect = pygame.Rect(x1, y+6, w, self.track_h-12)
+                rect = pygame.Rect(x1, y + 6, w, self.track_h - 12)
                 c.rect = rect
                 col = COL_CLIP_SEL if c.selected else COL_CLIP
                 pygame.draw.rect(surf, col, rect, border_radius=6)
                 pygame.draw.rect(surf, (col[0]//2, col[1]//2, col[2]//2), rect, 2, border_radius=6)
-                # handles
-                pygame.draw.rect(surf, (240,240,240), pygame.Rect(rect.left-2, rect.top, 4, rect.h), 0)
-                pygame.draw.rect(surf, (240,240,240), pygame.Rect(rect.right-2, rect.top, 4, rect.h), 0)
-                # label
+                pygame.draw.rect(surf, (240, 240, 240), pygame.Rect(rect.left - 2, rect.top, 4, rect.h))
+                pygame.draw.rect(surf, (240, 240, 240), pygame.Rect(rect.right - 2, rect.top, 4, rect.h))
                 label = f"{c.name}  x{c.speed:.2f}  g{c.gain:.2f}"
-                surf.blit(FONT_SM.render(label, True, (15,15,18)), (rect.x+6, rect.y+4))
+                surf.blit(FONT_SM.render(label, True, (15, 15, 18)), (rect.x + 6, rect.y + 4))
 
-    def draw_topbar(self, surf):
-        pygame.draw.rect(surf, COL_PANEL, pygame.Rect(0,0, WIDTH, self.top_bar_h))
+    def draw_topbar(self, surf, width):
+        pygame.draw.rect(surf, COL_PANEL, pygame.Rect(0, 0, width, self.top_bar_h))
         for b in [self.btn_play, self.btn_stop, self.btn_save, self.btn_add_track,
-                  self.btn_import, self.btn_delete, self.btn_split, self.btn_zoom_in, self.btn_zoom_out]:
+                  self.btn_import, self.btn_delete, self.btn_split, self.btn_zoom_in, self.btn_zoom_out, self.btn_snap]:
             b.draw(surf)
-        # status
-        surf.blit(FONT_SM.render(self.status, True, self.status_col),(860, 18))
+        surf.blit(FONT_SM.render(self.status, True, self.status_col), (width - 360, 18))
 
-    def set_zoom(self, new_pps):
-        self.px_per_sec = max(20.0, min(400.0, float(new_pps)))
-
-    def update_selected_sliders(self):
-        c = self.selected_clip
-        if c is None: return
-        c.gain = self.sld_gain.val
-        c.speed = self.sld_speed.val
-
+    # ----- main loop -----
     def run(self):
         clock = pygame.time.Clock()
-        running = True
-        # allow drop files
+        global WIDTH, HEIGHT, screen
         try:
-            pygame.event.set_allowed([pygame.QUIT, pygame.DROPFILE, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION, pygame.KEYDOWN])
+            pygame.event.set_allowed([
+                pygame.QUIT, pygame.DROPFILE, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
+                pygame.MOUSEMOTION, pygame.KEYDOWN, pygame.VIDEORESIZE
+            ])
         except Exception:
             pass
 
+        running = True
+        last_tick_ms = pygame.time.get_ticks()
+
         while running:
-            dt = clock.tick(60)
+            now = pygame.time.get_ticks()
+            dt_sec = (now - last_tick_ms) / 1000.0
+            last_tick_ms = now
+
             mouse = pygame.mouse.get_pos()
             buttons = pygame.mouse.get_pressed()
 
-            # update hover states
+            # Button hovers
             for b in [self.btn_play, self.btn_stop, self.btn_save, self.btn_add_track,
-                      self.btn_import, self.btn_delete, self.btn_split, self.btn_zoom_in, self.btn_zoom_out]:
+                      self.btn_import, self.btn_delete, self.btn_split, self.btn_zoom_in, self.btn_zoom_out, self.btn_snap]:
                 b.update(mouse)
 
-            self.sld_gain.update(mouse, buttons)
-            self.sld_speed.update(mouse, buttons)
-            self.update_selected_sliders()
+            # Sliders only when NOT dragging clips/faders
+            if self.drag_mode is None and self.selected_clip is not None:
+                self.sld_gain.update(mouse, buttons)
+                self.sld_speed.update(mouse, buttons)
+                self.selected_clip.gain = self.sld_gain.val
+                self.selected_clip.speed = self.sld_speed.val
 
+            # Events
             for e in pygame.event.get():
                 if e.type == pygame.QUIT:
                     running = False
-                elif e.type == pygame.KEYDOWN or e.type == pygame.KEYUP:
+                elif e.type == pygame.VIDEORESIZE:
+                    WIDTH, HEIGHT = e.w, e.h
+                    screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
+                elif e.type in (pygame.KEYDOWN, pygame.KEYUP):
                     self.handle_keys(e)
                 elif e.type == pygame.DROPFILE:
                     path = e.file
                     try:
-                        y,_ = load_audio(path)
+                        y, _ = load_audio(path)
                         name = os.path.basename(path)
                         c = Clip(y, name=name, start=self.playhead, speed=1.0, gain=1.0)
                         c.track_index = self.selected_track
                         self.tracks[self.selected_track].clips.append(c)
                         self.select_clip(c)
-                        self.set_status(f"Imported (drop) {name}")
+                        self.set_status(f"Imported (drop) {name} → Track {self.selected_track+1}")
                     except Exception as ex:
                         self.set_status(f"Drop import failed: {ex}", ok=False)
-                elif e.type == pygame.MOUSEBUTTONDOWN and e.button==1:
+                elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                     self.on_mousedown(e.pos, e.button)
-                    # buttons
                     for b in [self.btn_play, self.btn_stop, self.btn_save, self.btn_add_track,
-                              self.btn_import, self.btn_delete, self.btn_split, self.btn_zoom_in, self.btn_zoom_out]:
+                              self.btn_import, self.btn_delete, self.btn_split, self.btn_zoom_in, self.btn_zoom_out, self.btn_snap]:
                         b.handle(e)
-                elif e.type == pygame.MOUSEBUTTONUP and e.button==1:
+                elif e.type == pygame.MOUSEBUTTONUP and e.button == 1:
                     self.on_mouseup(e.pos, e.button)
                 elif e.type == pygame.MOUSEMOTION:
                     self.on_mousemove(e.pos, buttons)
 
-            # update playhead while playing
+            # Playback timeline + meters (playhead always advances while playing)
             if self.playing and self.play_started_ms is not None:
-                elapsed = (pygame.time.get_ticks() - self.play_started_ms) / 1000.0
-                self.playhead = min(self.play_end_sec, self.playhead + elapsed)  # naive increment
-                self.play_started_ms = pygame.time.get_ticks()
-                if self.playhead >= self.play_end_sec - 1e-3:
+                self.playhead += dt_sec
+                # update meters at current time
+                self._update_track_meters(self.render_start_sec + self.playhead - self.render_start_sec)
+                if self.play_end_sec is not None and self.playhead >= self.play_end_sec - 1e-3:
                     self.stop()
+            else:
+                self._update_track_meters(self.playhead)
 
-            # draw
+            # Draw
             screen.fill(COL_BG)
-            self.draw_topbar(screen)
-            self.draw_ruler(screen)
-            # controls panel on left
-            pygame.draw.rect(screen, COL_PANEL, pygame.Rect(0, self.top_bar_h, 170, self.ruler_h + len(self.tracks)*self.track_h))
+            self.draw_topbar(screen, WIDTH)
+            pygame.draw.rect(screen, COL_PANEL,
+                             pygame.Rect(0, self.top_bar_h, 190, self.ruler_h + len(self.tracks)*self.track_h))
             self.sld_gain.draw(screen); self.sld_speed.draw(screen)
-            self.draw_tracks(screen)
-
+            self.draw_ruler(screen, WIDTH)
+            self.draw_tracks(screen, WIDTH, HEIGHT)
             pygame.display.flip()
+
         pygame.quit()
+
 
 def main():
     app = SimpleEditor()
     # Optional CLI import
-    if len(sys.argv)>1 and os.path.isfile(sys.argv[1]):
+    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
         try:
-            y,_ = load_audio(sys.argv[1])
+            y, _ = load_audio(sys.argv[1])
             name = os.path.basename(sys.argv[1])
             c = Clip(y, name=name, start=0.0, speed=1.0, gain=1.0)
             c.track_index = 0
@@ -707,6 +860,7 @@ def main():
         except Exception as e:
             app.set_status(f"CLI load failed: {e}", ok=False)
     app.run()
+
 
 if __name__ == "__main__":
     main()
