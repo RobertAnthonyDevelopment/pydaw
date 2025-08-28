@@ -252,6 +252,7 @@ class Track:
         self._fader_rect: Optional[pygame.Rect] = None
         self._mute_rect: Optional[pygame.Rect] = None
         self._solo_rect: Optional[pygame.Rect] = None
+        self._delete_rect: Optional[pygame.Rect] = None
 
 
 # ---------- UI / mixer ----------
@@ -262,7 +263,7 @@ pygame.sndarray.use_arraytype("numpy")
 
 WIDTH, HEIGHT = 1280, 860
 screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
-pygame.display.set_caption("Simple Audio Editor — Fixed Version")
+pygame.display.set_caption("Simple Audio Editor — Enhanced Version")
 
 # Try to initialize mixer with different parameters
 mixer_initialized = False
@@ -303,6 +304,7 @@ COL_MUTE = (210, 80, 80)
 COL_SOLO = (240, 200, 90)
 COL_SCROLL = (70, 70, 90)
 COL_SCROLL_KNOB = (110, 110, 140)
+COL_DELETE = (220, 80, 80)
 
 pygame.font.init()
 FONT_MD = pygame.font.SysFont("Arial", 16, bold=True)
@@ -310,17 +312,19 @@ FONT_SM = pygame.font.SysFont("Arial", 12)
 
 
 class Button:
-    def __init__(self, x, y, w, h, label, fn, toggle=False, state=False):
+    def __init__(self, x, y, w, h, label, fn, toggle=False, state=False, color=COL_ACC, hover_color=None):
         self.rect = pygame.Rect(x, y, w, h)
         self.label = label
         self.fn = fn
         self.toggle = toggle
         self.state = state
         self.hover = False
+        self.color = color
+        self.hover_color = hover_color or (min(color[0]+40, 255), min(color[1]+40, 255), min(color[2]+40, 255))
 
     def draw(self, surf):
-        base = COL_ACC2 if (self.toggle and self.state) else COL_ACC
-        col = base if not self.hover else (min(base[0]+40, 255), min(base[1]+40, 255), min(base[2]+40, 255))
+        base = self.color if (self.toggle and self.state) else self.color
+        col = base if not self.hover else self.hover_color
         pygame.draw.rect(surf, col, self.rect, border_radius=6)
         pygame.draw.rect(surf, (col[0]//2, col[1]//2, col[2]//2), self.rect, 2, border_radius=6)
         t = FONT_SM.render(self.label, True, COL_TXT)
@@ -397,6 +401,8 @@ class SimpleEditor:
         # playback
         self.playhead = 0.0
         self.playing = False
+        self.paused = False
+        self.looping = False
         self.play_start_clock: Optional[float] = None
         self.play_start_pos: float = 0.0
         self.play_end_sec: Optional[float] = None
@@ -414,13 +420,20 @@ class SimpleEditor:
         # UI
         x = 10
         self.btn_play = Button(x, 10, 60, 30, "Play", self.play); x += 70
+        self.btn_pause = Button(x, 10, 60, 30, "Pause", self.pause); x += 70
         self.btn_stop = Button(x, 10, 60, 30, "Stop", self.stop); x += 70
+        self.btn_loop = Button(x, 10, 60, 30, "Loop", self.toggle_loop, toggle=True, state=self.looping); x += 70
+        self.btn_rewind = Button(x, 10, 60, 30, "Rewind", self.rewind); x += 70
+        self.btn_ff = Button(x, 10, 60, 30, "Fast Fwd", self.fast_forward); x += 70
+        self.btn_home = Button(x, 10, 60, 30, "Home", self.go_home); x += 70
+        self.btn_end = Button(x, 10, 60, 30, "End", self.go_end); x += 70
         self.btn_tone = Button(x, 10, 70, 30, "Test Tone", self.test_tone); x += 80
         self.btn_save = Button(x, 10, 110, 30, "Save Mix…", self.saveas); x += 120
         self.btn_save_stems = Button(x, 10, 130, 30, "Save Stems…", self.save_stems); x += 140
         self.btn_add_track = Button(x, 10, 90, 30, "+ Track", self.add_track); x += 100
+        self.btn_del_track = Button(x, 10, 90, 30, "- Track", self.delete_track, color=COL_DELETE); x += 100
         self.btn_import = Button(x, 10, 120, 30, "Import Clip", self.import_clip); x += 130
-        self.btn_delete = Button(x, 10, 90, 30, "Delete", self.delete_selected); x += 100
+        self.btn_delete = Button(x, 10, 90, 30, "Delete", self.delete_selected, color=COL_DELETE); x += 100
         self.btn_split = Button(x, 10, 120, 30, "Split @ Play", self.split_at_playhead); x += 130
         self.btn_zoom_in = Button(x, 10, 48, 30, "+", lambda: self.set_zoom(self.px_per_sec * 1.25)); x += 58
         self.btn_zoom_out = Button(x, 10, 48, 30, "-", lambda: self.set_zoom(self.px_per_sec / 1.25)); x += 58
@@ -442,6 +455,35 @@ class SimpleEditor:
         self._create_track()
         self.selected_track = len(self.tracks) - 1
         self.set_status(f"Added Track {self.selected_track + 1}")
+
+    def delete_track(self):
+        if len(self.tracks) <= 1:
+            self.set_status("Cannot delete the last track.", ok=False)
+            return
+            
+        if self.selected_track >= len(self.tracks):
+            self.selected_track = len(self.tracks) - 1
+            
+        # If we're deleting a track with the selected clip, deselect it
+        if self.selected_clip and self.selected_clip.track_index == self.selected_track:
+            self.select_clip(None)
+            
+        # Move clips from the deleted track to the previous track if possible
+        if self.selected_track > 0:
+            prev_track = self.tracks[self.selected_track - 1]
+            for clip in self.tracks[self.selected_track].clips:
+                clip.track_index = self.selected_track - 1
+                prev_track.clips.append(clip)
+        
+        # Remove the track
+        del self.tracks[self.selected_track]
+        
+        # Adjust selected track index
+        if self.selected_track >= len(self.tracks):
+            self.selected_track = len(self.tracks) - 1
+            
+        self.invalidate_render()
+        self.set_status(f"Deleted Track {self.selected_track + 1}")
 
     def _ensure_track_for_y(self, y_px: int) -> int:
         """Return a valid track index for a mouse y; auto-create if below last lane."""
@@ -530,7 +572,6 @@ class SimpleEditor:
             y, _ = load_audio(path)
             if y.size == 0:
                 self.set_status(f"Failed to load audio from {path}", ok=False)
-                return
             name = os.path.basename(path)
             start_t = self.playhead
             ti = self._ensure_track_for_y(my)
@@ -566,6 +607,43 @@ class SimpleEditor:
             self.set_status("Clip split.")
         else:
             self.set_status("Playhead not inside clip.", ok=False)
+
+    # ---------- playback controls ----------
+    def toggle_loop(self):
+        self.looping = not self.looping
+        self.btn_loop.state = self.looping
+        self.set_status(f"Looping {'ON' if self.looping else 'OFF'}")
+
+    def rewind(self):
+        self.playhead = max(0.0, self.playhead - 5.0)  # Rewind 5 seconds
+        self.set_status("Rewound 5 seconds")
+
+    def fast_forward(self):
+        self.playhead = min(self.project_length(), self.playhead + 5.0)  # Fast forward 5 seconds
+        self.set_status("Fast forwarded 5 seconds")
+
+    def go_home(self):
+        self.playhead = 0.0
+        self.set_status("Moved to start")
+
+    def go_end(self):
+        self.playhead = self.project_length()
+        self.set_status("Moved to end")
+
+    def pause(self):
+        if self.playing:
+            if self.paused:
+                # Resume playback
+                self.play_start_clock = time.perf_counter() - (self.playhead - self.play_start_pos)
+                self.paused = False
+                self.set_status("Resumed playback")
+            else:
+                # Pause playback
+                self.paused = True
+                pygame.mixer.pause()
+                self.set_status("Playback paused")
+        else:
+            self.set_status("Not playing", ok=False)
 
     # ---------- rendering / stems ----------
     def render_mix_with_stems(self, start_sec: float = 0.0) -> Tuple[np.ndarray, float, List[np.ndarray]]:
@@ -686,8 +764,16 @@ class SimpleEditor:
         return True
 
     def play(self):
-        if self.playing:
+        if self.playing and not self.paused:
             self.stop()
+            return
+            
+        if self.paused:
+            # Resume from pause
+            self.paused = False
+            pygame.mixer.unpause()
+            self.play_start_clock = time.perf_counter() - (self.playhead - self.play_start_pos)
+            self.set_status("Resumed playback")
             return
             
         try:
@@ -702,6 +788,7 @@ class SimpleEditor:
             self.play_start_clock = time.perf_counter()
             self.play_end_sec = len(mix) / SR
             self.playing = True
+            self.paused = False
             self.set_status("Playing…", ok=True)
         except Exception as e:
             self.set_status(f"Play failed: {e}", ok=False)
@@ -712,6 +799,7 @@ class SimpleEditor:
         except:
             pass
         self.playing = False
+        self.paused = False
         self.play_channel = None
         self.play_start_clock = None
         self.set_status("Stopped.", ok=True)
@@ -798,8 +886,10 @@ class SimpleEditor:
     def draw_topbar(self, surf):
         pygame.draw.rect(surf, COL_PANEL, (0, 0, WIDTH, self.top_bar_h))
         mouse = pygame.mouse.get_pos()
-        for b in [self.btn_play, self.btn_stop, self.btn_tone, self.btn_save, self.btn_save_stems,
-                  self.btn_add_track, self.btn_import, self.btn_delete,
+        for b in [self.btn_play, self.btn_pause, self.btn_stop, self.btn_loop, 
+                  self.btn_rewind, self.btn_ff, self.btn_home, self.btn_end,
+                  self.btn_tone, self.btn_save, self.btn_save_stems,
+                  self.btn_add_track, self.btn_del_track, self.btn_import, self.btn_delete,
                   self.btn_split, self.btn_zoom_in, self.btn_zoom_out, self.btn_snap]:
             b.update(mouse); b.draw(surf)
         self.sld_gain.draw(surf); self.sld_speed.draw(surf); self.sld_bpm.draw(surf)
@@ -839,27 +929,41 @@ class SimpleEditor:
             pygame.draw.rect(surf, (55, 55, 70), hdr, 1)
             title_col = COL_TXT if i != self.selected_track else COL_ACC
             surf.blit(FONT_MD.render(tr.name, True, title_col), (10, y + 6))
+            
+            # Mute button
             tr._mute_rect = pygame.Rect(12, y + 30, 24, 18)
-            tr._solo_rect = pygame.Rect(42, y + 30, 24, 18)
             pygame.draw.rect(surf, COL_MUTE if tr.mute else (70, 70, 80), tr._mute_rect, border_radius=4)
-            pygame.draw.rect(surf, COL_SOLO if tr.solo else (70, 70, 80), tr._solo_rect, border_radius=4)
             surf.blit(FONT_SM.render("M", True, COL_TXT), tr._mute_rect.move(7, 1))
+            
+            # Solo button
+            tr._solo_rect = pygame.Rect(42, y + 30, 24, 18)
+            pygame.draw.rect(surf, COL_SOLO if tr.solo else (70, 70, 80), tr._solo_rect, border_radius=4)
             surf.blit(FONT_SM.render("S", True, COL_TXT), tr._solo_rect.move(7, 1))
-            fx, fw = 80, self.timeline_origin_x - 100
+            
+            # Delete track button
+            tr._delete_rect = pygame.Rect(72, y + 30, 24, 18)
+            pygame.draw.rect(surf, COL_DELETE, tr._delete_rect, border_radius=4)
+            surf.blit(FONT_SM.render("X", True, COL_TXT), tr._delete_rect.move(7, 1))
+            
+            # Volume fader
+            fx, fw = 100, self.timeline_origin_x - 120
             tr._fader_rect = pygame.Rect(fx, y + 30, fw, 6)
             pygame.draw.rect(surf, (60, 60, 80), tr._fader_rect, border_radius=3)
             knob_x = int(fx + tr.volume * (fw - 1))
             pygame.draw.circle(surf, COL_ACC2, (knob_x, y + 33), 7)
+            
             # meter
             meter = pygame.Rect(self.timeline_origin_x - 20, y + 6, 8, self.track_h - 20)
             pygame.draw.rect(surf, COL_METER_BG, meter)
             m_h = int((self.track_h - 20) * max(0.0, min(1.0, tr.meter_level)))
             if m_h > 0:
                 pygame.draw.rect(surf, COL_METER, (meter.x, meter.bottom - m_h, meter.w, m_h))
+                
             # lane
             lane = pygame.Rect(self.timeline_origin_x, y, WIDTH - self.timeline_origin_x - self.right_bar_w, self.track_h - 4)
             col = (24, 24, 30) if i % 2 == 0 else (22, 22, 28)
             pygame.draw.rect(surf, col, lane)
+            
             # clips
             for c in tr.clips:
                 left, right = c.bounds()
@@ -957,6 +1061,10 @@ class SimpleEditor:
             self.playhead = 0.0
         elif e.key == pygame.K_END:
             self.playhead = self.project_length()
+        elif e.key == pygame.K_LEFT:
+            self.playhead = max(0.0, self.playhead - 1.0)
+        elif e.key == pygame.K_RIGHT:
+            self.playhead = min(self.project_length(), self.playhead + 1.0)
         elif e.key == pygame.K_z:
             if self.selected_clip:
                 l, r = self.selected_clip.bounds()
@@ -968,14 +1076,18 @@ class SimpleEditor:
             self.saveas()
         elif (e.key == pygame.K_e) and (pygame.key.get_mods() & (pygame.KMOD_CTRL | pygame.KMOD_META)):
             self.save_stems()
+        elif (e.key == pygame.K_l) and (pygame.key.get_mods() & (pygame.KMOD_CTRL | pygame.KMOD_META)):
+            self.toggle_loop()
 
     def mouse_down(self, e):
         mx, my = e.pos
         self.drag_last_mouse = (mx, my)
 
         # Check if any button was clicked
-        mouse_buttons = [self.btn_play, self.btn_stop, self.btn_tone, self.btn_save, self.btn_save_stems,
-                         self.btn_add_track, self.btn_import, self.btn_delete,
+        mouse_buttons = [self.btn_play, self.btn_pause, self.btn_stop, self.btn_loop,
+                         self.btn_rewind, self.btn_ff, self.btn_home, self.btn_end,
+                         self.btn_tone, self.btn_save, self.btn_save_stems,
+                         self.btn_add_track, self.btn_del_track, self.btn_import, self.btn_delete,
                          self.btn_split, self.btn_zoom_in, self.btn_zoom_out, self.btn_snap]
         
         for button in mouse_buttons:
@@ -988,7 +1100,7 @@ class SimpleEditor:
         if my >= top_tracks and mx < self.timeline_origin_x:
             ti = self._ensure_track_for_y(my)
             self.selected_track = ti
-            # fader/mute/solo hit-testing (start fader drag)
+            # fader/mute/solo/delete hit-testing
             tr = self.tracks[ti]
             if tr._fader_rect and tr._fader_rect.collidepoint(mx, my):
                 self.drag_mode = 'fader'; self.drag_fader_track = ti; return
@@ -996,6 +1108,8 @@ class SimpleEditor:
                 tr.mute = not tr.mute; self.invalidate_render(); return
             if tr._solo_rect and tr._solo_rect.collidepoint(mx, my):
                 tr.solo = not tr.solo; self.invalidate_render(); return
+            if tr._delete_rect and tr._delete_rect.collidepoint(mx, my):
+                self.delete_track(); return
             return
 
         # ruler scrub
@@ -1137,11 +1251,17 @@ class SimpleEditor:
                 self.selected_clip.speed = s
                 self.invalidate_render()
         self.bpm = float(self.sld_bpm.val)
-        if self.playing and self.play_start_clock is not None:
+        if self.playing and self.play_start_clock is not None and not self.paused:
             elapsed = time.perf_counter() - self.play_start_clock
             self.playhead = self.play_start_pos + elapsed
             if self.play_end_sec is not None and self.playhead >= self.play_end_sec:
-                self.stop()
+                if self.looping:
+                    self.playhead = 0.0
+                    self.play_start_pos = 0.0
+                    self.play_start_clock = time.perf_counter()
+                    self.play()
+                else:
+                    self.stop()
             if self.playhead > self.h_off_sec + 0.85 * self.visible_secs():
                 self.h_off_sec = max(0.0, self.playhead - 0.85 * self.visible_secs())
         self.update_meters()
