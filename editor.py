@@ -1,15 +1,16 @@
+
 import os
 import time
 import math
 import pickle
 import pygame
 import numpy as np
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Tuple
 
 from audio_utils import load_audio, time_stretch, to_stereo, to_int16_stereo, apply_fades, SR
 from file_dialogs import choose_open_file, choose_save_file, choose_folder
 from models import Clip, Track
-from ui_components import *
+from ui_components import *  # Button, Slider, TextInput, colors/fonts
 
 class SimpleEditor:
     def __init__(self):
@@ -25,14 +26,14 @@ class SimpleEditor:
         # Initialize mixer
         self._init_mixer()
         
-        # layout - updated with better spacing
-        self.timeline_origin_x = 250
+        # Layout constants
+        self.timeline_origin_x = 300
         self.track_h = 100
         self.ruler_h = 36
-        self.top_bar_h = 130  # Increased to accommodate button rows
-        self.bottom_bar_h = 20
-        self.right_bar_w = 12
-        self.left_panel_w = 250  # Increased for better spacing
+        self.top_bar_h = 180
+        self.bottom_bar_h = 24
+        self.right_bar_w = 16
+        self.left_panel_w = 280
 
         # view / scroll
         self.px_per_sec = 100.0
@@ -107,9 +108,8 @@ class SimpleEditor:
 
     def _create_ui_elements(self):
         """Create all UI elements with proper positioning"""
-        # First row of buttons
-        x = 10
-        y = 10
+        # Transport controls (top row)
+        x, y = 10, 10
         self.btn_play = Button(x, y, 60, 30, "Play", self.play); x += 70
         self.btn_pause = Button(x, y, 60, 30, "Pause", self.pause); x += 70
         self.btn_stop = Button(x, y, 60, 30, "Stop", self.stop); x += 70
@@ -117,43 +117,40 @@ class SimpleEditor:
         self.btn_rewind = Button(x, y, 60, 30, "Rewind", self.rewind); x += 70
         self.btn_ff = Button(x, y, 60, 30, "Fast Fwd", self.fast_forward); x += 70
         self.btn_home = Button(x, y, 60, 30, "Home", self.go_home); x += 70
-        self.btn_end = Button(x, y, 60, 30, "End", self.go_end); x += 70
+        self.btn_end = Button(x, y, 60, 30, "End", self.go_end)
         
-        # Second row of buttons
-        x = 10
-        y += 40
-        self.btn_tone = Button(x, y, 70, 30, "Test Tone", self.test_tone); x += 80
-        self.btn_save = Button(x, y, 110, 30, "Save Mix…", self.saveas); x += 120
-        self.btn_save_stems = Button(x, y, 130, 30, "Save Stems…", self.save_stems); x += 140
+        # File operations (second row)
+        x, y = 10, 50
+        self.btn_tone = Button(x, y, 80, 30, "Test Tone", self.test_tone); x += 90
+        self.btn_save = Button(x, y, 100, 30, "Save Mix", self.saveas); x += 110
+        self.btn_save_stems = Button(x, y, 120, 30, "Save Stems", self.save_stems); x += 130
         self.btn_add_track = Button(x, y, 90, 30, "+ Track", self.add_track); x += 100
-        self.btn_del_track = Button(x, y, 90, 30, "- Track", self.delete_track, color=COL_DELETE); x += 100
+        self.btn_del_track = Button(x, y, 90, 30, "- Track", self.delete_track, color=COL_DELETE)
         
-        # Third row of buttons
-        x = 10
-        y += 40
-        self.btn_import = Button(x, y, 120, 30, "Import Clip", self.import_clip); x += 130
-        self.btn_delete = Button(x, y, 90, 30, "Delete", self.delete_selected, color=COL_DELETE); x += 100
-        self.btn_split = Button(x, y, 120, 30, "Split @ Play", self.split_at_playhead); x += 130
-        self.btn_zoom_in = Button(x, y, 48, 30, "+", lambda: self.set_zoom(self.px_per_sec * 1.25)); x += 58
-        self.btn_zoom_out = Button(x, y, 48, 30, "-", lambda: self.set_zoom(self.px_per_sec / 1.25)); x += 58
-        self.btn_snap = Button(x, y, 70, 30, "Snap", self.toggle_snap, toggle=True, state=self.snap); x += 80
+        # Editing controls (third row)
+        x, y = 10, 90
+        self.btn_import = Button(x, y, 100, 30, "Import", self.import_clip); x += 110
+        self.btn_delete = Button(x, y, 80, 30, "Delete", self.delete_selected, color=COL_DELETE); x += 90
+        self.btn_split = Button(x, y, 100, 30, "Split", self.split_at_playhead); x += 110
+        self.btn_zoom_in = Button(x, y, 50, 30, "+", lambda: self.set_zoom(self.px_per_sec * 1.25)); x += 60
+        self.btn_zoom_out = Button(x, y, 50, 30, "-", lambda: self.set_zoom(self.px_per_sec / 1.25)); x += 60
+        self.btn_snap = Button(x, y, 70, 30, "Snap", self.toggle_snap, toggle=True, state=self.snap)
         
-        # Fourth row of buttons
-        x = 10
-        y += 40
+        # Project controls (fourth row)
+        x, y = 10, 130
         self.btn_new = Button(x, y, 70, 30, "New", self.new_project); x += 80
         self.btn_open = Button(x, y, 70, 30, "Open", self.open_project); x += 80
         self.btn_save_proj = Button(x, y, 70, 30, "Save", self.save_project); x += 80
-        self.btn_save_proj_as = Button(x, y, 90, 30, "Save As", self.save_project_as); x += 100
+        self.btn_save_proj_as = Button(x, y, 90, 30, "Save As", self.save_project_as)
 
-        # Text inputs - positioned with proper spacing
-        self.bpm_input = TextInput(10, self.top_bar_h - 50, 100, 30, "BPM", str(self.bpm), True)
-        self.time_sig_numerator = TextInput(120, self.top_bar_h - 50, 40, 30, "Time Sig", "4", True)
-        self.time_sig_denominator = TextInput(170, self.top_bar_h - 50, 40, 30, "/", "4", True)
+        # Text inputs - positioned in left panel
+        self.bpm_input = TextInput(20, self.top_bar_h + 20, 100, 30, "BPM", str(self.bpm), True)
+        self.time_sig_numerator = TextInput(130, self.top_bar_h + 20, 40, 30, "", "4", True)
+        self.time_sig_denominator = TextInput(180, self.top_bar_h + 20, 40, 30, "", "4", True)
 
-        # Sliders - positioned with proper spacing
-        self.sld_gain = Slider(10, self.top_bar_h + 10, 190, "Clip Gain", 0.0, 2.0, 1.0)
-        self.sld_speed = Slider(10, self.top_bar_h + 40, 190, "Clip Speed", 0.5, 1.5, 1.0)
+        # Sliders - positioned in left panel with proper spacing
+        self.sld_gain = Slider(20, self.top_bar_h + 70, self.left_panel_w - 40, "Clip Gain", 0.0, 2.0, 1.0)
+        self.sld_speed = Slider(20, self.top_bar_h + 110, self.left_panel_w - 40, "Clip Speed", 0.5, 1.5, 1.0)
 
     def on_resize(self, w, h):
         """Handle window resize events"""
@@ -174,7 +171,7 @@ class SimpleEditor:
         
         total_sec = max(self.project_length(), self.visible_secs())
         vis_sec = self.visible_secs()
-        self.h_off_sec = max(0, min(self.h_off_sec, total_sec - vis_sec))
+        self.h_off_sec = max(0.0, min(self.h_off_sec, total_sec - vis_sec))
 
     def _create_track(self):
         idx = len(self.tracks) + 1
@@ -536,7 +533,7 @@ class SimpleEditor:
     def stop(self):
         try:
             pygame.mixer.stop()
-        except:
+        except Exception:
             pass
         self.playing = False
         self.paused = False
@@ -567,15 +564,19 @@ class SimpleEditor:
             self.set_status(f"Test tone failed: {e}", ok=False)
 
     def saveas(self):
+        """Export current mix to WAV."""
         path = choose_save_file("Save Mix As", "mix.wav")
         if not path:
-            self.set_status("Save cancelled.", ok=True); return
+            self.set_status("Save cancelled.", ok=True)
+            return
         mix, start, _ = self.render_mix_with_stems(0.0)
         stereo = to_stereo(mix)
         try:
             import wave
             with wave.open(path, 'wb') as wf:
-                wf.setnchannels(2); wf.setsampwidth(2); wf.setframerate(SR)
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(SR)
                 wf.writeframes(to_int16_stereo(stereo).tobytes())
             self.set_status(f"Saved mix → {path}")
         except Exception as e:
@@ -584,16 +585,19 @@ class SimpleEditor:
     def save_stems(self):
         folder = choose_folder("Choose folder for stems")
         if not folder:
-            self.set_status("Stem export cancelled.", ok=True); return
-        mix, start, stems = self.render_mix_with_stems(0.0)
+            self.set_status("Stem export cancelled.", ok=True)
+            return
+        _, _, stems = self.render_mix_with_stems(0.0)
         try:
+            import wave
             for i, (tr, stem) in enumerate(zip(self.tracks, stems)):
                 st = to_stereo(stem)
                 name = f"{i+1:02d}_{tr.name.replace(' ', '_')}.wav"
                 out = os.path.join(folder, name)
-                import wave
                 with wave.open(out, 'wb') as wf:
-                    wf.setnchannels(2); wf.setsampwidth(2); wf.setframerate(SR)
+                    wf.setnchannels(2)
+                    wf.setsampwidth(2)
+                    wf.setframerate(SR)
                     wf.writeframes(to_int16_stereo(st).tobytes())
             self.set_status(f"Exported stems → {folder}")
         except Exception as e:
@@ -601,14 +605,16 @@ class SimpleEditor:
 
     def update_meters(self):
         if not self.playing or self._stems is None:
-            for tr in self.tracks: tr.meter_level = 0.0
+            for tr in self.tracks:
+                tr.meter_level = 0.0
             return
             
         i = int(self.playhead * SR)
         win = int(0.05 * SR)  # 50ms
         for tr, stem in zip(self.tracks, self._stems):
             if i >= len(stem):
-                tr.meter_level = 0.0; continue
+                tr.meter_level = 0.0
+                continue
             s = stem[i:i+win]
             tr.meter_level = float(min(1.0, max(0.0, np.sqrt(np.mean((s * tr.volume) ** 2)) * 2.0)))
 
@@ -627,14 +633,19 @@ class SimpleEditor:
         modified = "*" if self.project_modified else ""
         proj_text = f"{proj_name}{modified}"
         txt = FONT_SM.render(proj_text, True, COL_TXT)
-        self.screen.blit(txt, (self.WIDTH - 150, self.HEIGHT - self.bottom_bar_h + 2))
+        self.screen.blit(txt, (self.WIDTH - 150, self.HEIGHT - self.bottom_bar_h + 4))
         
         txt = FONT_SM.render(self.status, True, self.status_col)
-        self.screen.blit(txt, (10, self.HEIGHT - self.bottom_bar_h + 2))
+        self.screen.blit(txt, (10, self.HEIGHT - self.bottom_bar_h + 4))
 
     def draw_topbar(self):
-        """Draw the top toolbar"""
+        """Draw the top toolbar with all buttons"""
+        # Draw background for button area
         pygame.draw.rect(self.screen, COL_PANEL, (0, 0, self.WIDTH, self.top_bar_h))
+        
+        # Draw separator line
+        pygame.draw.line(self.screen, (60, 60, 80), (0, self.top_bar_h), (self.WIDTH, self.top_bar_h), 2)
+        
         mouse = pygame.mouse.get_pos()
         buttons = [self.btn_play, self.btn_pause, self.btn_stop, self.btn_loop,
                   self.btn_rewind, self.btn_ff, self.btn_home, self.btn_end,
@@ -644,7 +655,8 @@ class SimpleEditor:
                   self.btn_new, self.btn_open, self.btn_save_proj, self.btn_save_proj_as]
         
         for b in buttons:
-            b.update(mouse); b.draw(self.screen)
+            b.update(mouse)
+            b.draw(self.screen)
 
     def draw_left_panel(self):
         """Draw the left control panel"""
@@ -652,61 +664,64 @@ class SimpleEditor:
         panel_rect = pygame.Rect(0, self.top_bar_h, self.left_panel_w, self.HEIGHT - self.top_bar_h)
         pygame.draw.rect(self.screen, COL_PANEL, panel_rect)
         
-        # Draw BPM display
-        bpm_rect = pygame.Rect(10, self.top_bar_h + 10, self.left_panel_w - 20, 50)
-        pygame.draw.rect(self.screen, COL_BPM_BG, bpm_rect, border_radius=6)
-        pygame.draw.rect(self.screen, (70, 70, 90), bpm_rect, 2, border_radius=6)
+        # Draw separator line
+        pygame.draw.line(self.screen, (60, 60, 80), (self.left_panel_w, self.top_bar_h), 
+                         (self.left_panel_w, self.HEIGHT), 2)
         
-        # Draw BPM text
-        bpm_text = FONT_LG.render(f"{self.bpm:.1f} BPM", True, COL_BPM_TEXT)
-        self.screen.blit(bpm_text, (bpm_rect.centerx - bpm_text.get_width()//2, bpm_rect.centery - bpm_text.get_height()//2))
+        # Draw section headers
+        section_title = FONT_MD.render("Project Settings", True, COL_TXT)
+        self.screen.blit(section_title, (20, self.top_bar_h + 5))
         
-        # Draw time signature
-        time_sig_rect = pygame.Rect(10, self.top_bar_h + 70, self.left_panel_w - 20, 30)
-        time_sig_text = FONT_MD.render(f"Time Signature: {self.time_sig_numerator.text}/{self.time_sig_denominator.text}", True, COL_TXT)
-        self.screen.blit(time_sig_text, (time_sig_rect.x, time_sig_rect.y - 20))
+        # Draw BPM and time signature labels
+        bpm_label = FONT_SM.render("BPM:", True, COL_TXT)
+        self.screen.blit(bpm_label, (20, self.top_bar_h + 20))
         
-        # Draw transport info
-        transport_rect = pygame.Rect(10, self.top_bar_h + 110, self.left_panel_w - 20, 80)
-        pygame.draw.rect(self.screen, COL_BPM_BG, transport_rect, border_radius=6)
-        pygame.draw.rect(self.screen, (70, 70, 90), transport_rect, 2, border_radius=6)
+        time_sig_label = FONT_SM.render("Time Signature:", True, COL_TXT)
+        self.screen.blit(time_sig_label, (20, self.top_bar_h + 55))
         
-        # Transport info text
-        transport_title = FONT_MD.render("Transport", True, COL_TXT)
-        self.screen.blit(transport_title, (transport_rect.centerx - transport_title.get_width()//2, transport_rect.y + 10))
-        
-        playhead_text = FONT_SM.render(f"Playhead: {self.playhead:.2f}s", True, COL_TXT)
-        self.screen.blit(playhead_text, (transport_rect.x + 10, transport_rect.y + 40))
-        
-        project_len_text = FONT_SM.render(f"Length: {self.project_length():.2f}s", True, COL_TXT)
-        self.screen.blit(project_len_text, (transport_rect.x + 10, transport_rect.y + 60))
+        # Draw time signature divider
+        divider = FONT_SM.render("/", True, COL_TXT)
+        self.screen.blit(divider, (170, self.top_bar_h + 55))
         
         # Draw BPM input fields
         self.bpm_input.draw(self.screen)
         self.time_sig_numerator.draw(self.screen)
         self.time_sig_denominator.draw(self.screen)
         
-        # Draw clip controls if a clip is selected
-        if self.selected_clip:
-            clip_rect = pygame.Rect(10, self.top_bar_h + 200, self.left_panel_w - 20, 120)
-            pygame.draw.rect(self.screen, COL_BPM_BG, clip_rect, border_radius=6)
-            pygame.draw.rect(self.screen, (70, 70, 90), clip_rect, 2, border_radius=6)
-            
-            clip_title = FONT_MD.render("Selected Clip", True, COL_TXT)
-            self.screen.blit(clip_title, (clip_rect.centerx - clip_title.get_width()//2, clip_rect.y + 10))
-            
-            clip_name_text = FONT_SM.render(f"Name: {self.selected_clip.name}", True, COL_TXT)
-            self.screen.blit(clip_name_text, (clip_rect.x + 10, clip_rect.y + 40))
-            
-            clip_pos_text = FONT_SM.render(f"Position: {self.selected_clip.start:.2f}s", True, COL_TXT)
-            self.screen.blit(clip_pos_text, (clip_rect.x + 10, clip_rect.y + 60))
-            
-            clip_len_text = FONT_SM.render(f"Length: {self.selected_clip.eff_len_sec:.2f}s", True, COL_TXT)
-            self.screen.blit(clip_len_text, (clip_rect.x + 10, clip_rect.y + 80))
+        # Draw clip controls section header
+        clip_title = FONT_MD.render("Clip Controls", True, COL_TXT)
+        self.screen.blit(clip_title, (20, self.top_bar_h + 90))
         
         # Draw sliders
         self.sld_gain.draw(self.screen)
         self.sld_speed.draw(self.screen)
+        
+        # Draw clip info if a clip is selected
+        if self.selected_clip:
+            # Section header
+            info_title = FONT_MD.render("Selected Clip", True, COL_TXT)
+            self.screen.blit(info_title, (20, self.top_bar_h + 150))
+            
+            # Clip info background
+            info_rect = pygame.Rect(20, self.top_bar_h + 175, self.left_panel_w - 40, 120)
+            pygame.draw.rect(self.screen, COL_BPM_BG, info_rect, border_radius=6)
+            pygame.draw.rect(self.screen, (70, 70, 90), info_rect, 2, border_radius=6)
+            
+            # Clip details
+            clip_name_text = FONT_SM.render(f"Name: {self.selected_clip.name}", True, COL_TXT)
+            self.screen.blit(clip_name_text, (info_rect.x + 10, info_rect.y + 10))
+            
+            clip_pos_text = FONT_SM.render(f"Position: {self.selected_clip.start:.2f}s", True, COL_TXT)
+            self.screen.blit(clip_pos_text, (info_rect.x + 10, info_rect.y + 30))
+            
+            clip_len_text = FONT_SM.render(f"Length: {self.selected_clip.eff_len_sec:.2f}s", True, COL_TXT)
+            self.screen.blit(clip_len_text, (info_rect.x + 10, info_rect.y + 50))
+            
+            clip_gain_text = FONT_SM.render(f"Gain: {self.selected_clip.gain:.2f}", True, COL_TXT)
+            self.screen.blit(clip_gain_text, (info_rect.x + 10, info_rect.y + 70))
+            
+            clip_speed_text = FONT_SM.render(f"Speed: {self.selected_clip.speed:.2f}", True, COL_TXT)
+            self.screen.blit(clip_speed_text, (info_rect.x + 10, info_rect.y + 90))
 
     def draw_ruler_and_grid(self):
         """Draw the timeline ruler and grid"""
@@ -815,6 +830,7 @@ class SimpleEditor:
         if total > 0:
             frac = vis / max(total, 1e-9)
             frac = max(0.05, min(1.0, frac))
+            # FIX: use correct attribute name timeline_origin_x
             span_px = (self.WIDTH - self.timeline_origin_x - self.right_bar_w) * frac
             max_off = max(0.0, total - vis)
             off_frac = 0.0 if max_off <= 0 else (self.h_off_sec / max_off) * (1 - frac)
@@ -845,7 +861,7 @@ class SimpleEditor:
         """Handle mouse wheel events"""
         mods = pygame.key.get_mods()
         if mods & (pygame.KMOD_CTRL | pygame.KMOD_META):
-            mx, my = pygame.mouse.get_pos()
+            mx, _ = pygame.mouse.get_pos()
             t_anchor = self.x_to_time(mx)
             if e.y > 0:
                 self.set_zoom(self.px_per_sec * (1.15 ** e.y), anchor_time=t_anchor)
@@ -862,23 +878,34 @@ class SimpleEditor:
 
     def key(self, e):
         """Handle keyboard events"""
+        mods = pygame.key.get_mods()
+        ctrl_or_cmd = (mods & pygame.KMOD_CTRL) or (mods & pygame.KMOD_META)
+
         if e.key == pygame.K_SPACE:
             if self.playing: self.stop()
             else: self.play()
+
         elif e.key in (pygame.K_DELETE, pygame.K_BACKSPACE):
             self.delete_selected()
+
         elif e.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
             self.set_zoom(self.px_per_sec * 1.2)
+
         elif e.key in (pygame.K_MINUS, pygame.K_UNDERSCORE, pygame.K_KP_MINUS):
             self.set_zoom(self.px_per_sec / 1.2)
+
         elif e.key == pygame.K_HOME:
             self.playhead = 0.0
+
         elif e.key == pygame.K_END:
             self.playhead = self.project_length()
+
         elif e.key == pygame.K_LEFT:
             self.playhead = max(0.0, self.playhead - 1.0)
+
         elif e.key == pygame.K_RIGHT:
             self.playhead = min(self.project_length(), self.playhead + 1.0)
+
         elif e.key == pygame.K_z:
             if self.selected_clip:
                 l, r = self.selected_clip.bounds()
@@ -886,18 +913,32 @@ class SimpleEditor:
                 span = max(0.25, r - l)
                 self.set_zoom(max(60, min(400, (self.WIDTH - self.timeline_origin_x) / span)), anchor_time=mid)
                 self.h_off_sec = max(0.0, l - 0.25 * span)
-        elif (e.key == pygame.K_s) and (pygame.key.get_mods() & (pygame.KMOD_CTRL | pygame.KMOD_META)):
-            self.saveas()
-        elif (e.key == pygame.K_e) and (pygame.key.get_mods() & (pygame.KMOD_CTRL | pygame.KMOD_META)):
-            self.save_stems()
-        elif (e.key == pygame.K_l) and (pygame.key.get_mods() & (pygame.KMOD_CTRL | pygame.KMOD_META)):
-            self.toggle_loop()
-        elif (e.key == pygame.K_n) and (pygame.key.get_mods() & (pygame.KMOD_CTRL | pygame.KMOD_META)):
-            self.new_project()
-        elif (e.key == pygame.K_o) and (pygame.key.get_mods() & (pygame.KMOD_CTRL | pygame.KMOD_META)):
-            self.open_project()
-        elif (e.key == pygame.K_s) and (pygame.key.get_mods() & (pygame.KMOD_CTRL | pygame.KMOD_META)):
+
+        # Fixed conflicting shortcuts:
+        elif ctrl_or_cmd and (mods & pygame.KMOD_SHIFT) and e.key == pygame.K_s:
+            # Ctrl+Shift+S → Save Project As
+            self.save_project_as()
+
+        elif ctrl_or_cmd and e.key == pygame.K_s:
+            # Ctrl+S → Save Project
             self.save_project()
+
+        elif ctrl_or_cmd and e.key == pygame.K_m:
+            # Ctrl+M → Export Mix
+            self.saveas()
+
+        elif ctrl_or_cmd and e.key == pygame.K_e:
+            # Ctrl+E → Export Stems
+            self.save_stems()
+
+        elif ctrl_or_cmd and e.key == pygame.K_l:
+            self.toggle_loop()
+
+        elif ctrl_or_cmd and e.key == pygame.K_n:
+            self.new_project()
+
+        elif ctrl_or_cmd and e.key == pygame.K_o:
+            self.open_project()
 
     def mouse_down(self, e):
         """Handle mouse button down events"""
@@ -930,18 +971,18 @@ class SimpleEditor:
 
         # click track header selects track
         top_tracks = self.top_bar_h + self.ruler_h
-        if my >= top_tracks and mx >= self.left_panel_w and mx < self.timeline_origin_x:
+        if my >= top_tracks and self.left_panel_w <= mx < self.timeline_origin_x:
             ti = self._ensure_track_for_y(my)
             self.selected_track = ti
             # fader/mute/solo/delete hit-testing
             tr = self.tracks[ti]
-            if tr._fader_rect and tr._fader_rect.collidepoint(mx, my):
+            if getattr(tr, "_fader_rect", None) and tr._fader_rect.collidepoint(mx, my):
                 self.drag_mode = 'fader'; self.drag_fader_track = ti; return
-            if tr._mute_rect and tr._mute_rect.collidepoint(mx, my):
+            if getattr(tr, "_mute_rect", None) and tr._mute_rect.collidepoint(mx, my):
                 tr.mute = not tr.mute; self.invalidate_render(); self.mark_project_modified(); return
-            if tr._solo_rect and tr._solo_rect.collidepoint(mx, my):
+            if getattr(tr, "_solo_rect", None) and tr._solo_rect.collidepoint(mx, my):
                 tr.solo = not tr.solo; self.invalidate_render(); self.mark_project_modified(); return
-            if tr._delete_rect and tr._delete_rect.collidepoint(mx, my):
+            if getattr(tr, "_delete_rect", None) and tr._delete_rect.collidepoint(mx, my):
                 self.delete_track(); return
             return
 
@@ -1091,7 +1132,7 @@ class SimpleEditor:
         # Update BPM from input field
         try:
             new_bpm = float(self.bpm_input.text)
-            if new_bpm != self.bpm and new_bpm >= 60 and new_bpm <= 200:
+            if new_bpm != self.bpm and 60 <= new_bpm <= 200:
                 self.bpm = new_bpm
                 self.mark_project_modified()
         except ValueError:
