@@ -40,7 +40,8 @@ from ui_components import (
     FONT_MD,
 )
 
-# ---------- Simple, inline pickers for .pdaw ----------
+
+# ---------- Simple pickers for .pdaw ----------
 
 def _choose_open_project() -> Optional[str]:
     if sys.platform == "darwin":
@@ -49,15 +50,19 @@ def _choose_open_project() -> Optional[str]:
             osa = 'POSIX path of (choose file with prompt "Open Project" of type {"public.data"})'
             res = subprocess.run(["osascript", "-e", osa], capture_output=True, text=True)
             out = res.stdout.strip()
-            return out if out else None
+            return out or None
         except Exception:
             pass
     try:
         import tkinter as tk
         from tkinter import filedialog
-        root = tk.Tk(); root.withdraw(); root.update()
-        fp = filedialog.askopenfilename(title="Open Project",
-                                        filetypes=[("PyDAW Project", "*.pdaw"), ("All files", "*.*")])
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+        fp = filedialog.askopenfilename(
+            title="Open Project",
+            filetypes=[("PyDAW Project", "*.pdaw"), ("All files", "*.*")]
+        )
         root.destroy()
         return fp or None
     except Exception:
@@ -79,11 +84,15 @@ def _choose_save_project(default_name: str = "project.pdaw") -> Optional[str]:
     try:
         import tkinter as tk
         from tkinter import filedialog
-        root = tk.Tk(); root.withdraw(); root.update()
-        fp = filedialog.asksaveasfilename(title="Save Project As",
-                                          defaultextension=".pdaw",
-                                          filetypes=[("PyDAW Project", "*.pdaw"), ("All files", "*.*")],
-                                          initialfile=default_name)
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+        fp = filedialog.asksaveasfilename(
+            title="Save Project As",
+            defaultextension=".pdaw",
+            filetypes=[("PyDAW Project", "*.pdaw"), ("All files", "*.*")],
+            initialfile=default_name
+        )
         root.destroy()
         return fp or None
     except Exception:
@@ -113,14 +122,34 @@ class SimpleEditor:
         self.TOP_PAD = 10
         self.BOTTOM_PAD = 10
         self.TOPBAR_ROWS = 4
-        self.top_bar_h = self.TOP_PAD + self.TOPBAR_ROWS * self.BUTTON_H + (self.TOPBAR_ROWS - 1) * self.ROW_GAP_Y + self.BOTTOM_PAD
+        self.top_bar_h = (
+            self.TOP_PAD
+            + self.TOPBAR_ROWS * self.BUTTON_H
+            + (self.TOPBAR_ROWS - 1) * self.ROW_GAP_Y
+            + self.BOTTOM_PAD
+        )
 
         self.ruler_h = 36
         self.bottom_bar_h = 24
-        self.right_bar_w = 16
 
-        self.left_panel_w = 300
+        # Scrollbars
+        self.scrollbar_h = 16
+        self.scrollbar_w = 16
+        self.right_bar_w = self.scrollbar_w
+
+        # Panels
+        self.MIN_LEFT_PANEL = 220
+        self.MAX_LEFT_PANEL_RATIO = 0.45  # of window width
         self.track_header_w = 260
+
+        # Left panel (user-resizable via splitter)
+        self.left_panel_w = 300
+        self.user_left_panel_w: Optional[int] = None  # remember user width across window resizes
+        self.SPLIT_HIT_PAD = 6
+        self.splitter_drag = False
+        self._splitter_grab_dx = 0
+
+        # Derived
         self.timeline_origin_x = self.left_panel_w + self.track_header_w
         self.track_h = 100
 
@@ -130,6 +159,10 @@ class SimpleEditor:
         self.v_off_px = 0
         self._drag_scroll_h = False
         self._drag_scroll_v = False
+        self.h_bar_rect = pygame.Rect(0, 0, 0, 0)
+        self.v_bar_rect = pygame.Rect(0, 0, 0, 0)
+        self.h_scroll_rect = pygame.Rect(0, 0, 0, 0)
+        self.v_scroll_rect = pygame.Rect(0, 0, 0, 0)
 
         # Grid / snapping
         self.bpm = 120.0
@@ -192,8 +225,15 @@ class SimpleEditor:
                 print(f"Failed to initialize mixer: {e}")
                 sys.exit(1)
 
+    # ---------- UI creation & reflow ----------
+
     def _create_ui_elements(self):
-        self.top_bar_h = self.TOP_PAD + self.TOPBAR_ROWS * self.BUTTON_H + (self.TOPBAR_ROWS - 1) * self.ROW_GAP_Y + self.BOTTOM_PAD
+        self.top_bar_h = (
+            self.TOP_PAD
+            + self.TOPBAR_ROWS * self.BUTTON_H
+            + (self.TOPBAR_ROWS - 1) * self.ROW_GAP_Y
+            + self.BOTTOM_PAD
+        )
 
         def add_row(button_defs, row_index: int, start_x=10):
             y = self.TOP_PAD + row_index * (self.BUTTON_H + self.ROW_GAP_Y)
@@ -208,21 +248,41 @@ class SimpleEditor:
             return made
 
         # Rows
-        row1 = [("Play", self.play, {}), ("Pause", self.pause, {}), ("Stop", self.stop, {}),
-                ("Loop", self.toggle_loop, {"toggle": True, "state": self.looping}),
-                ("Rewind", self.rewind, {}), ("Fast Fwd", self.fast_forward, {}),
-                ("Home", self.go_home, {}), ("End", self.go_end, {})]
-        row2 = [("Test Tone", self.test_tone, {"w": 100}), ("Save Mix", self.saveas, {"w": 100}),
-                ("Save Stems", self.save_stems, {"w": 110}), ("+ Track", self.add_track, {}),
-                ("- Track", self.delete_track, {})]
-        row3 = [("Import", self.import_clip, {"w": 100}), ("Delete", self.delete_selected, {}),
-                ("Split", self.split_at_playhead, {"w": 90}), ("Zoom -", lambda: self.set_zoom(self.px_per_sec/1.25), {"w": 80}),
-                ("Zoom +", lambda: self.set_zoom(self.px_per_sec*1.25), {"w": 80}),
-                ("Snap", self.toggle_snap, {"toggle": True, "state": self.snap, "w": 80})]
-        row4 = [("New", self.new_project, {"w": 80}), ("Open", self.open_project, {"w": 80}),
-                ("Save", self.save_project, {"w": 80}), ("Save As", self.save_project_as, {"w": 100})]
+        row1 = [
+            ("Play", self.play, {}),
+            ("Pause", self.pause, {}),
+            ("Stop", self.stop, {}),
+            ("Loop", self.toggle_loop, {"toggle": True, "state": self.looping}),
+            ("Rewind", self.rewind, {}),
+            ("Fast Fwd", self.fast_forward, {}),
+            ("Home", self.go_home, {}),
+            ("End", self.go_end, {}),
+        ]
+        row2 = [
+            ("Test Tone", self.test_tone, {"w": 100}),
+            ("Save Mix", self.saveas, {"w": 100}),
+            ("Save Stems", self.save_stems, {"w": 110}),
+            ("+ Track", self.add_track, {}),
+            ("- Track", self.delete_track, {}),
+        ]
+        row3 = [
+            ("Import", self.import_clip, {"w": 100}),
+            ("Delete", self.delete_selected, {}),
+            ("Split", self.split_at_playhead, {"w": 90}),
+            ("Zoom -", lambda: self.set_zoom(self.px_per_sec / 1.25), {"w": 80}),
+            ("Zoom +", lambda: self.set_zoom(self.px_per_sec * 1.25), {"w": 80}),
+            ("Snap", self.toggle_snap, {"toggle": True, "state": self.snap, "w": 80}),
+        ]
+        row4 = [
+            ("New", self.new_project, {"w": 80}),
+            ("Open", self.open_project, {"w": 80}),
+            ("Save", self.save_project, {"w": 80}),
+            ("Save As", self.save_project_as, {"w": 100}),
+        ]
 
-        self._topbar_buttons = add_row(row1, 0) + add_row(row2, 1) + add_row(row3, 2) + add_row(row4, 3)
+        self._topbar_buttons = (
+            add_row(row1, 0) + add_row(row2, 1) + add_row(row3, 2) + add_row(row4, 3)
+        )
 
         # Left panel inputs (labels rendered by panel)
         base_x = 20
@@ -230,18 +290,48 @@ class SimpleEditor:
         self.bpm_input = TextInput(base_x, y0 + 18, 110, 30, "", str(self.bpm), True)
         self.time_sig_numerator = TextInput(base_x + 130, y0 + 18, 42, 30, "", "4", True)
         self.time_sig_denominator = TextInput(base_x + 188, y0 + 18, 42, 30, "", "4", True)
-        self.sld_gain = Slider(base_x, y0 + 120, self.left_panel_w - 2 * base_x, "Clip Gain", 0.0, 2.0, 1.0)
-        self.sld_speed = Slider(base_x, y0 + 164, self.left_panel_w - 2 * base_x, "Clip Speed", 0.25, 2.0, 1.0)
+
+        # Sliders with added spacing
+        self.sld_gain = Slider(
+            base_x, y0 + 128, self.left_panel_w - 2 * base_x, "Clip Gain", 0.0, 2.0, 1.0
+        )
+        self.sld_speed = Slider(
+            base_x, y0 + 188, self.left_panel_w - 2 * base_x, "Clip Speed", 0.25, 2.0, 1.0
+        )
+
+    def _reflow_ui_preserve(self):
+        """Recreate UI widgets but keep current values/texts."""
+        try:
+            gain = self.sld_gain.val
+            speed = self.sld_speed.val
+            bpm_t = self.bpm_input.text
+            ts_n = self.time_sig_numerator.text
+            ts_d = self.time_sig_denominator.text
+        except Exception:
+            gain, speed, bpm_t, ts_n, ts_d = 1.0, 1.0, str(self.bpm), "4", "4"
+
+        self._create_ui_elements()
+        self.sld_gain.val = gain
+        self.sld_speed.val = speed
+        self.bpm_input.text = bpm_t
+        self.time_sig_numerator.text = ts_n
+        self.time_sig_denominator.text = ts_d
 
     # ---------- Layout / resize ----------
 
     def on_resize(self, w, h):
         self.WIDTH, self.HEIGHT = w, h
         self.screen = pygame.display.set_mode((self.WIDTH, self.HEIGHT), pygame.RESIZABLE)
-        self.left_panel_w = min(360, max(260, self.WIDTH // 4))
-        self.track_header_w = min(380, max(220, self.WIDTH // 5))
+
+        # Respect user-chosen panel width if set; clamp to sensible range
+        max_panel = int(self.WIDTH * self.MAX_LEFT_PANEL_RATIO)
+        if self.user_left_panel_w is None:
+            self.left_panel_w = min(360, max(260, self.WIDTH // 4))
+        else:
+            self.left_panel_w = int(max(self.MIN_LEFT_PANEL, min(self.user_left_panel_w, max_panel)))
+
         self.timeline_origin_x = self.left_panel_w + self.track_header_w
-        self._create_ui_elements()
+        self._reflow_ui_preserve()
 
         total_px = self.total_track_pixels()
         vis_px = self.HEIGHT - self.top_bar_h - self.ruler_h - self.bottom_bar_h
@@ -355,7 +445,9 @@ class SimpleEditor:
                 path = res.stdout.strip() if res.returncode == 0 else None
             else:
                 from tkinter import filedialog, Tk
-                root = Tk(); root.withdraw(); root.update()
+                root = Tk()
+                root.withdraw()
+                root.update()
                 path = filedialog.askopenfilename(
                     title="Import Audio",
                     filetypes=[("Audio", "*.wav *.mp3 *.flac *.aiff *.aif *.ogg"), ("All files", "*.*")]
@@ -369,19 +461,22 @@ class SimpleEditor:
         mx, my = pygame.mouse.get_pos()
         self._import_at_screen_pos(path, mx, my)
 
-    def _ensure_track_for_y(self, y_px: int) -> int:
+    def _ensure_track_for_y(self, y_px: int, create_if_needed: bool = False) -> int:
         top = self.top_bar_h + self.ruler_h
         if y_px < top:
-            return self.selected_track
-        lane = (y_px + self.v_off_px - top) // self.track_h
+            return self.selected_track if self.tracks else 0
+        lane = int((y_px + self.v_off_px - top) // self.track_h)
         if lane < 0:
-            return self.selected_track
+            return self.selected_track if self.tracks else 0
         if lane >= len(self.tracks):
-            while len(self.tracks) <= lane:
-                self._create_track()
-            self.mark_project_modified()
-            self.set_status(f"Auto-created Track {int(lane) + 1}")
-        return int(lane)
+            if create_if_needed:
+                while len(self.tracks) <= lane:
+                    self._create_track()
+                self.mark_project_modified()
+                self.set_status(f"Auto-created Track {lane + 1}")
+            else:
+                lane = max(0, len(self.tracks) - 1)
+        return lane
 
     def _import_at_screen_pos(self, path: str, mx: int, my: int):
         try:
@@ -391,7 +486,7 @@ class SimpleEditor:
                 return
             name = os.path.basename(path)
             start_t = self.playhead
-            ti = self._ensure_track_for_y(my)
+            ti = self._ensure_track_for_y(my, create_if_needed=True)
             c = Clip(y, name=name, start=start_t, speed=1.0, gain=1.0)
             c.track_index = ti
             self.tracks[ti].clips.append(c)
@@ -515,7 +610,7 @@ class SimpleEditor:
 
                 take = min(n_total - i0, len(stretched))
                 if take > 0:
-                    stem[i0:i0 + take] += stretched[:take] * c.gain  # fixed slice
+                    stem[i0:i0 + take] += stretched[:take] * c.gain
 
             stems[ti] = stems[ti] * tr.volume
 
@@ -636,11 +731,15 @@ class SimpleEditor:
                     path += ".wav"
             else:
                 from tkinter import filedialog, Tk
-                root = Tk(); root.withdraw(); root.update()
-                path = filedialog.asksaveasfilename(title="Save Mix As",
-                                                    defaultextension=".wav",
-                                                    filetypes=[("WAV", "*.wav")],
-                                                    initialfile="mix.wav")
+                root = Tk()
+                root.withdraw()
+                root.update()
+                path = filedialog.asksaveasfilename(
+                    title="Save Mix As",
+                    defaultextension=".wav",
+                    filetypes=[("WAV", "*.wav")],
+                    initialfile="mix.wav"
+                )
                 root.destroy()
         except Exception:
             path = None
@@ -671,7 +770,9 @@ class SimpleEditor:
                 folder = res.stdout.strip() if res.returncode == 0 else None
             else:
                 from tkinter import filedialog, Tk
-                root = Tk(); root.withdraw(); root.update()
+                root = Tk()
+                root.withdraw()
+                root.update()
                 folder = filedialog.askdirectory(title="Choose folder for stems")
                 root.destroy()
         except Exception:
@@ -711,7 +812,9 @@ class SimpleEditor:
                 tr.meter_level = 0.0
                 continue
             s = stem[i:i + win]
-            tr.meter_level = float(min(1.0, max(0.0, np.sqrt(np.mean((s * tr.volume) ** 2)) * 2.0)))
+            tr.meter_level = float(
+                min(1.0, max(0.0, np.sqrt(np.mean((s * tr.volume) ** 2)) * 2.0))
+            )
 
     # ---------- Drawing ----------
 
@@ -742,12 +845,40 @@ class SimpleEditor:
             b.draw(self.screen)
 
     def draw_left_panel(self):
+        # Left panel
         panel_rect = pygame.Rect(0, self.top_bar_h, self.left_panel_w, self.HEIGHT - self.top_bar_h)
         pygame.draw.rect(self.screen, COL_PANEL, panel_rect)
-        pygame.draw.line(self.screen, (60, 60, 80),
-                         (self.left_panel_w, self.top_bar_h),
-                         (self.left_panel_w, self.HEIGHT), 2)
 
+        # Splitter (draggable)
+        split_x = self.left_panel_w
+        splitter_rect = pygame.Rect(
+            split_x - self.SPLIT_HIT_PAD // 2,
+            self.top_bar_h,
+            self.SPLIT_HIT_PAD,
+            self.HEIGHT - self.top_bar_h
+        )
+        hover = splitter_rect.collidepoint(pygame.mouse.get_pos())
+        pygame.draw.rect(
+            self.screen, (60, 60, 80),
+            (split_x - 1, self.top_bar_h, 2, self.HEIGHT - self.top_bar_h)
+        )
+        pygame.draw.rect(
+            self.screen,
+            COL_SCROLL_KNOB if (hover or self.splitter_drag) else (70, 70, 90),
+            splitter_rect,
+            0
+        )
+
+        # Divider toward track header
+        pygame.draw.line(
+            self.screen,
+            (60, 60, 80),
+            (self.left_panel_w, self.top_bar_h),
+            (self.left_panel_w, self.HEIGHT),
+            2
+        )
+
+        # Panel content
         x = 20
         y = self.top_bar_h + 10
 
@@ -766,16 +897,19 @@ class SimpleEditor:
         div = FONT_SM.render("/", True, COL_TXT)
         self.screen.blit(div, (x + 176, y + 24 - div.get_height() // 2))
 
-        y += 76
+        # extra padding before Clip Controls
+        y += 84
 
         self.screen.blit(FONT_MD.render("Clip Controls", True, COL_TXT), (x, y))
-        y += 28
+        y += 20
 
-        self.sld_gain.rect.topleft = (x, y)
+        self.sld_gain.rect.topleft = (x, y + 10)
+        self.sld_gain.rect.width = self.left_panel_w - 2 * x
         self.sld_gain.draw(self.screen)
-        y += 44
+        y += 60
 
-        self.sld_speed.rect.topleft = (x, y)
+        self.sld_speed.rect.topleft = (x, y + 6)
+        self.sld_speed.rect.width = self.left_panel_w - 2 * x
         self.sld_speed.draw(self.screen)
         y += 52
 
@@ -785,11 +919,16 @@ class SimpleEditor:
             info_rect = pygame.Rect(x, y + 20, self.left_panel_w - 40, 120)
             pygame.draw.rect(self.screen, COL_BPM_BG, info_rect, border_radius=6)
             pygame.draw.rect(self.screen, (70, 70, 90), info_rect, 2, border_radius=6)
-            self.screen.blit(FONT_SM.render(f"Name: {self.selected_clip.name}", True, COL_TXT), (info_rect.x + 10, info_rect.y + 10))
-            self.screen.blit(FONT_SM.render(f"Position: {self.selected_clip.start:.2f}s", True, COL_TXT), (info_rect.x + 10, info_rect.y + 30))
-            self.screen.blit(FONT_SM.render(f"Length: {self.selected_clip.eff_len_sec:.2f}s", True, COL_TXT), (info_rect.x + 10, info_rect.y + 50))
-            self.screen.blit(FONT_SM.render(f"Gain: {self.selected_clip.gain:.2f}", True, COL_TXT), (info_rect.x + 10, info_rect.y + 70))
-            self.screen.blit(FONT_SM.render(f"Speed: {self.selected_clip.speed:.2f}", True, COL_TXT), (info_rect.x + 10, info_rect.y + 90))
+            self.screen.blit(FONT_SM.render(f"Name: {self.selected_clip.name}", True, COL_TXT),
+                             (info_rect.x + 10, info_rect.y + 10))
+            self.screen.blit(FONT_SM.render(f"Position: {self.selected_clip.start:.2f}s", True, COL_TXT),
+                             (info_rect.x + 10, info_rect.y + 30))
+            self.screen.blit(FONT_SM.render(f"Length: {self.selected_clip.eff_len_sec:.2f}s", True, COL_TXT),
+                             (info_rect.x + 10, info_rect.y + 50))
+            self.screen.blit(FONT_SM.render(f"Gain: {self.selected_clip.gain:.2f}", True, COL_TXT),
+                             (info_rect.x + 10, info_rect.y + 70))
+            self.screen.blit(FONT_SM.render(f"Speed: {self.selected_clip.speed:.2f}", True, COL_TXT),
+                             (info_rect.x + 10, info_rect.y + 90))
 
     def draw_ruler_and_grid(self):
         y0 = self.top_bar_h
@@ -816,6 +955,7 @@ class SimpleEditor:
                 self.screen.blit(label, (x - 4, y0 + 4))
             t += bar
 
+        # header column
         pygame.draw.rect(self.screen, COL_PANEL,
                          (self.left_panel_w, self.top_bar_h + self.ruler_h,
                           self.track_header_w,
@@ -886,43 +1026,47 @@ class SimpleEditor:
                          (x, self.top_bar_h), (x, self.HEIGHT - self.bottom_bar_h), 2)
 
     def draw_scrollbars(self):
-        # Horizontal
-        y = self.HEIGHT - self.bottom_bar_h - 10
-        pygame.draw.rect(self.screen, COL_SCROLL,
-                         (self.timeline_origin_x, y, self.WIDTH - self.timeline_origin_x - self.right_bar_w, 10))
+        # Horizontal track area
+        y = self.HEIGHT - self.bottom_bar_h - self.scrollbar_h
+        w = self.WIDTH - self.timeline_origin_x - self.right_bar_w
+        self.h_bar_rect = pygame.Rect(self.timeline_origin_x, y, max(0, w), self.scrollbar_h)
+        pygame.draw.rect(self.screen, COL_SCROLL, self.h_bar_rect)
+        pygame.draw.rect(self.screen, (70, 70, 90), self.h_bar_rect, 1)
+
         total = max(self.project_length(), self.visible_secs())
         vis = self.visible_secs()
-        if total > 0:
-            frac = max(0.05, min(1.0, vis / max(total, 1e-9)))
-            span_px = (self.WIDTH - self.timeline_origin_x - self.right_bar_w) * frac
+        if total > 0 and w > 0:
+            frac = max(0.06, min(1.0, vis / total))
+            span_px = int(w * frac)
             max_off = max(0.0, total - vis)
             off_frac = 0.0 if max_off <= 0 else (self.h_off_sec / max_off) * (1 - frac)
-            knob_x = int(self.timeline_origin_x + off_frac * (self.WIDTH - self.timeline_origin_x - self.right_bar_w))
-            self.h_scroll_rect = pygame.Rect(knob_x, y, int(span_px), 10)
-            pygame.draw.rect(self.screen, COL_SCROLL_KNOB, self.h_scroll_rect)
+            knob_x = int(self.timeline_origin_x + off_frac * w)
+            self.h_scroll_rect = pygame.Rect(knob_x, y + 2, span_px, self.scrollbar_h - 4)
+            pygame.draw.rect(self.screen, COL_SCROLL_KNOB, self.h_scroll_rect, border_radius=4)
         else:
-            self.h_scroll_rect = pygame.Rect(self.timeline_origin_x, y,
-                                             self.WIDTH - self.timeline_origin_x - self.right_bar_w, 10)
+            self.h_scroll_rect = pygame.Rect(self.timeline_origin_x, y + 2, w, self.scrollbar_h - 4)
+            pygame.draw.rect(self.screen, COL_SCROLL_KNOB, self.h_scroll_rect, border_radius=4)
 
-        # Vertical
+        # Vertical track area
         x = self.WIDTH - self.right_bar_w
-        pygame.draw.rect(self.screen, COL_SCROLL,
-                         (x, self.top_bar_h + self.ruler_h, self.right_bar_w,
-                          self.HEIGHT - self.top_bar_h - self.ruler_h - self.bottom_bar_h))
+        h = self.HEIGHT - self.top_bar_h - self.ruler_h - self.bottom_bar_h
+        self.v_bar_rect = pygame.Rect(x, self.top_bar_h + self.ruler_h, self.scrollbar_w, max(0, h))
+        pygame.draw.rect(self.screen, COL_SCROLL, self.v_bar_rect)
+        pygame.draw.rect(self.screen, (70, 70, 90), self.v_bar_rect, 1)
+
         total_px = self.total_track_pixels()
-        vis_px = self.HEIGHT - self.top_bar_h - self.ruler_h - self.bottom_bar_h
-        if total_px > 0:
-            frac = max(0.05, min(1.0, vis_px / max(total_px, 1)))
-            span = int((self.HEIGHT - self.top_bar_h - self.ruler_h - self.bottom_bar_h) * frac)
+        vis_px = h
+        if total_px > 0 and h > 0:
+            frac = max(0.08, min(1.0, vis_px / total_px))
+            span = int(h * frac)
             max_off = max(0, total_px - vis_px)
             off_frac = 0.0 if max_off <= 0 else (self.v_off_px / max_off) * (1 - frac)
-            knob_y = int(self.top_bar_h + self.ruler_h + off_frac *
-                         (self.HEIGHT - self.top_bar_h - self.ruler_h - self.bottom_bar_h))
-            self.v_scroll_rect = pygame.Rect(x, knob_y, self.right_bar_w, span)
-            pygame.draw.rect(self.screen, COL_SCROLL_KNOB, self.v_scroll_rect)
+            knob_y = int(self.top_bar_h + self.ruler_h + off_frac * h)
+            self.v_scroll_rect = pygame.Rect(x + 2, knob_y + 2, self.scrollbar_w - 4, max(8, span - 4))
+            pygame.draw.rect(self.screen, COL_SCROLL_KNOB, self.v_scroll_rect, border_radius=4)
         else:
-            self.v_scroll_rect = pygame.Rect(x, self.top_bar_h + self.ruler_h, self.right_bar_w,
-                                             self.HEIGHT - self.top_bar_h - self.ruler_h - self.bottom_bar_h)
+            self.v_scroll_rect = pygame.Rect(x + 2, self.top_bar_h + self.ruler_h + 2, self.scrollbar_w - 4, max(8, h - 4))
+            pygame.draw.rect(self.screen, COL_SCROLL_KNOB, self.v_scroll_rect, border_radius=4)
 
     # ---------- Interaction ----------
 
@@ -996,45 +1140,91 @@ class SimpleEditor:
         mx, my = e.pos
         self.drag_last_mouse = (mx, my)
 
+        # Splitter drag start?
+        if abs(mx - self.left_panel_w) <= self.SPLIT_HIT_PAD and my >= self.top_bar_h:
+            self.splitter_drag = True
+            self._splitter_grab_dx = mx - self.left_panel_w
+            return
+
+        # Topbar buttons
         for button in self._topbar_buttons:
             if button.rect.collidepoint(mx, my):
                 button.handle_click()
                 return
 
+        # Inputs
         for ti in (self.bpm_input, self.time_sig_numerator, self.time_sig_denominator):
             if ti.rect.collidepoint(mx, my):
                 ti.active = True
                 return
 
+        # Scrollbar hit-tests (bars jump; knobs drag)
+        if self.h_bar_rect.collidepoint(mx, my):
+            if self.h_scroll_rect.collidepoint(mx, my):
+                self._drag_scroll_h = True
+            else:
+                # jump to click location
+                w = self.h_bar_rect.w
+                if w > 0:
+                    frac = (mx - self.h_bar_rect.x) / w
+                    total = max(self.project_length(), self.visible_secs())
+                    vis = self.visible_secs()
+                    max_off = max(0.0, total - vis)
+                    self.h_off_sec = max(0.0, min(max_off, frac * max_off))
+            return
+
+        if self.v_bar_rect.collidepoint(mx, my):
+            if self.v_scroll_rect.collidepoint(mx, my):
+                self._drag_scroll_v = True
+            else:
+                h = self.v_bar_rect.h
+                if h > 0:
+                    frac = (my - self.v_bar_rect.y) / h
+                    total_px = self.total_track_pixels()
+                    vis_px = self.HEIGHT - self.top_bar_h - self.ruler_h - self.bottom_bar_h
+                    max_off = max(0, total_px - vis_px)
+                    self.v_off_px = int(max(0, min(max_off, frac * max_off)))
+            return
+
+        # Track header region
         top_tracks = self.top_bar_h + self.ruler_h
         if my >= top_tracks and self.left_panel_w <= mx < self.timeline_origin_x:
-            ti = self._ensure_track_for_y(my)
+            ti = self._ensure_track_for_y(my, create_if_needed=False)
             self.selected_track = ti
             tr = self.tracks[ti]
             if getattr(tr, "_fader_rect", None) and tr._fader_rect.collidepoint(mx, my):
-                self.drag_mode = "fader"; self.drag_fader_track = ti; return
+                self.drag_mode = "fader"
+                self.drag_fader_track = ti
+                return
             if getattr(tr, "_mute_rect", None) and tr._mute_rect.collidepoint(mx, my):
-                tr.mute = not tr.mute; self.invalidate_render(); self.mark_project_modified(); return
+                tr.mute = not tr.mute
+                self.invalidate_render()
+                self.mark_project_modified()
+                return
             if getattr(tr, "_solo_rect", None) and tr._solo_rect.collidepoint(mx, my):
-                tr.solo = not tr.solo; self.invalidate_render(); self.mark_project_modified(); return
+                tr.solo = not tr.solo
+                self.invalidate_render()
+                self.mark_project_modified()
+                return
             if getattr(tr, "_delete_rect", None) and tr._delete_rect.collidepoint(mx, my):
-                self.delete_track(); return
+                self.delete_track()
+                return
             return
 
+        # Ruler scrub
         if self.top_bar_h <= my <= self.top_bar_h + self.ruler_h and mx >= self.timeline_origin_x:
             self.playhead = max(0.0, self.x_to_time(mx))
             self.drag_mode = "scrub"
             return
 
-        if hasattr(self, "h_scroll_rect") and self.h_scroll_rect.collidepoint(mx, my):
-            self._drag_scroll_h = True; return
-        if hasattr(self, "v_scroll_rect") and self.v_scroll_rect.collidepoint(mx, my):
-            self._drag_scroll_v = True; return
-
+        # Right-button pan
         if e.button == 3:
-            self.drag_mode = "pan"; return
+            self.drag_mode = "pan"
+            return
 
+        # Timeline lanes
         if mx >= self.timeline_origin_x and my >= self.top_bar_h + self.ruler_h:
+            # hit clips first
             for ti in range(len(self.tracks)):
                 tr = self.tracks[ti]
                 for c in reversed(tr.clips):
@@ -1053,8 +1243,9 @@ class SimpleEditor:
                             self.drag_offset_time = self.x_to_time(mx) - c.start
                         self.drag_clip_ref = c
                         return
+            # empty lane: set playhead; clamp to existing tracks only
             self.playhead = self.maybe_snap(self.x_to_time(mx))
-            self.selected_track = self._ensure_track_for_y(my)
+            self.selected_track = self._ensure_track_for_y(my, create_if_needed=False)
             self.select_clip(None)
 
     def mouse_up(self, e):
@@ -1066,11 +1257,26 @@ class SimpleEditor:
         self._drag_scroll_h = False
         self._drag_scroll_v = False
 
+        if self.splitter_drag:
+            self.splitter_drag = False
+            self.user_left_panel_w = self.left_panel_w  # remember user width
+
     def mouse_motion(self, e):
         mx, my = e.pos
         dx = mx - self.drag_last_mouse[0]
         dy = my - self.drag_last_mouse[1]
         self.drag_last_mouse = (mx, my)
+
+        # Splitter drag
+        if self.splitter_drag:
+            max_panel = int(self.WIDTH * self.MAX_LEFT_PANEL_RATIO)
+            new_w = int(mx - self._splitter_grab_dx)
+            new_w = max(self.MIN_LEFT_PANEL, min(max_panel, new_w))
+            if new_w != self.left_panel_w:
+                self.left_panel_w = new_w
+                self.timeline_origin_x = self.left_panel_w + self.track_header_w
+                self._reflow_ui_preserve()
+            return
 
         if self.drag_mode == "scrub":
             self.playhead = max(0.0, self.x_to_time(mx))
@@ -1080,20 +1286,16 @@ class SimpleEditor:
             total = max(self.project_length(), self.visible_secs())
             vis = self.visible_secs()
             max_off = max(0.0, total - vis)
-            track_w = self.WIDTH - self.timeline_origin_x - self.right_bar_w
-            frac = vis / total if total else 1.0
-            denom = max(1, int((1 - frac) * track_w))
-            self.h_off_sec = max(0.0, min(max_off, self.h_off_sec + (dx / denom) * max_off))
+            w = max(1, self.h_bar_rect.w)
+            self.h_off_sec = max(0.0, min(max_off, self.h_off_sec + (dx / w) * max_off))
             return
 
         if self._drag_scroll_v:
             total_px = self.total_track_pixels()
             vis_px = self.HEIGHT - self.top_bar_h - self.ruler_h - self.bottom_bar_h
             max_off = max(0, total_px - vis_px)
-            track_h = self.HEIGHT - self.top_bar_h - self.ruler_h - self.bottom_bar_h
-            frac = vis_px / total_px if total_px else 1.0
-            denom = max(1, int((1 - frac) * track_h))
-            self.v_off_px = int(max(0, min(max_off, self.v_off_px + (dy / denom) * max_off)))
+            h = max(1, self.v_bar_rect.h)
+            self.v_off_px = int(max(0, min(max_off, self.v_off_px + (dy / h) * max_off)))
             return
 
         if self.drag_mode == "pan":
@@ -1111,7 +1313,7 @@ class SimpleEditor:
         if self.drag_mode == "move":
             new_start = self.x_to_time(mx) - self.drag_offset_time
             c.start = self.maybe_snap(new_start)
-            c.track_index = self._ensure_track_for_y(my)
+            c.track_index = self._ensure_track_for_y(my, create_if_needed=False)  # clamp, don't create
             self.invalidate_render()
             return
 
